@@ -1,0 +1,8 @@
+bin/
+.stage/
+state/
+logs/
+*.lock
+private_tests/local_testing/.env
+private_tests/local_testing/logs/
+private_tests/local_testing/tmp/
