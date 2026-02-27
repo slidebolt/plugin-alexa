@@ -12,6 +12,7 @@ import (
 
 	runner "github.com/slidebolt/sdk-runner"
 	"github.com/slidebolt/sdk-types"
+	"github.com/slidebolt/sdk-entities/light"
 )
 
 type PluginAlexaPlugin struct {
@@ -168,17 +169,18 @@ func (p *PluginAlexaPlugin) handleDirective(payload map[string]any) {
 }
 
 func (p *PluginAlexaPlugin) forwardDirectiveToTarget(proxy AlexaDeviceProxy, namespace, name string, payload map[string]any) {
-	cmdPayload := map[string]any{"type": name}
+	cmdPayload := map[string]any{}
 	switch namespace {
 	case "Alexa.PowerController":
 		if name == "TurnOn" {
-			cmdPayload["type"] = "TurnOn"
+			cmdPayload["type"] = light.ActionTurnOn
 		} else {
-			cmdPayload["type"] = "TurnOff"
+			cmdPayload["type"] = light.ActionTurnOff
 		}
 	case "Alexa.BrightnessController":
 		if v, ok := payload["brightness"]; ok {
-			cmdPayload["level"] = v
+			cmdPayload["type"] = light.ActionSetBrightness
+			cmdPayload["brightness"] = v
 		}
 	case "Alexa.ColorController":
 		if name == "SetColor" {
@@ -187,14 +189,14 @@ func (p *PluginAlexaPlugin) forwardDirectiveToTarget(proxy AlexaDeviceProxy, nam
 				s, _ := toFloat(color["saturation"])
 				v, _ := toFloat(color["brightness"])
 				r, g, b := hsvToRGB(h, s, v)
-				cmdPayload["r"] = r
-				cmdPayload["g"] = g
-				cmdPayload["b"] = b
+				cmdPayload["type"] = light.ActionSetRGB
+				cmdPayload["rgb"] = []int{r, g, b}
 			}
 		}
 	case "Alexa.ColorTemperatureController":
 		if v, ok := payload["colorTemperatureInKelvin"]; ok {
-			cmdPayload["kelvin"] = v
+			cmdPayload["type"] = light.ActionSetTemperature
+			cmdPayload["temperature"] = v
 		}
 	}
 
