@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/slidebolt/sdk-entities/light"
 	"github.com/slidebolt/sdk-runner"
 	"github.com/slidebolt/sdk-types"
 )
@@ -112,7 +113,7 @@ func TestAlexaCommunication(t *testing.T) {
 
 	var payload map[string]any
 	json.Unmarshal(evt.Payload, &payload)
-	if payload["type"] != "TurnOn" {
-		t.Errorf("event payload mismatch: got %v, want TurnOn", payload["type"])
+	if payload["type"] != light.ActionTurnOn {
+		t.Errorf("event payload mismatch: got %v, want %s", payload["type"], light.ActionTurnOn)
 	}
 }

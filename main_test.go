@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/slidebolt/sdk-entities/light"
 	"github.com/slidebolt/sdk-types"
 )
 
@@ -74,7 +75,7 @@ func TestAlexaDirectiveForwarding(t *testing.T) {
 
 	var cmdPayload map[string]any
 	json.Unmarshal(params.Payload, &cmdPayload)
-	if cmdPayload["type"] != "TurnOn" {
+	if cmdPayload["type"] != light.ActionTurnOn {
 		t.Errorf("unexpected command payload: %v", cmdPayload)
 	}
 }

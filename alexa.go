@@ -5,6 +5,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/slidebolt/sdk-entities/light"
 	"github.com/slidebolt/sdk-types"
 )
 
@@ -68,7 +69,7 @@ func buildAlexaEndpoint(dev types.Device, entities []types.Entity) map[string]an
 	}
 
 	display := "SWITCH"
-	if primary.Domain == "light" || caps["SetBrightness"] || caps["SetRGB"] || caps["SetTemperature"] {
+	if primary.Domain == "light" || caps[light.ActionSetBrightness] || caps[light.ActionSetRGB] || caps[light.ActionSetTemperature] {
 		display = "LIGHT"
 	}
 
@@ -86,7 +87,7 @@ func buildAlexaEndpoint(dev types.Device, entities []types.Entity) map[string]an
 			},
 		},
 	}
-	if caps["SetBrightness"] {
+	if caps[light.ActionSetBrightness] {
 		alexaCaps = append(alexaCaps, map[string]any{
 			"type": "AlexaInterface", "interface": "Alexa.BrightnessController", "version": "3",
 			"properties": map[string]any{
@@ -94,7 +95,7 @@ func buildAlexaEndpoint(dev types.Device, entities []types.Entity) map[string]an
 			},
 		})
 	}
-	if caps["SetRGB"] {
+	if caps[light.ActionSetRGB] {
 		alexaCaps = append(alexaCaps, map[string]any{
 			"type": "AlexaInterface", "interface": "Alexa.ColorController", "version": "3",
 			"properties": map[string]any{
@@ -102,7 +103,7 @@ func buildAlexaEndpoint(dev types.Device, entities []types.Entity) map[string]an
 			},
 		})
 	}
-	if caps["SetTemperature"] {
+	if caps[light.ActionSetTemperature] {
 		alexaCaps = append(alexaCaps, map[string]any{
 			"type": "AlexaInterface", "interface": "Alexa.ColorTemperatureController", "version": "3",
 			"properties": map[string]any{
