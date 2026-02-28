@@ -243,7 +243,18 @@ func (p *PluginAlexaPlugin) OnDevicesList(current []types.Device) ([]types.Devic
 		SourceID:   "alexa-control",
 		SourceName: "Alexa Control",
 	}
-	return append(current, control), nil
+	out := append(current, control)
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for id := range p.alexaDevices {
+		out = append(out, types.Device{
+			ID:         id,
+			SourceID:   id,
+			SourceName: "Alexa Proxy Device",
+		})
+	}
+	return out, nil
 }
 func (p *PluginAlexaPlugin) OnDeviceSearch(q types.SearchQuery, res []types.Device) ([]types.Device, error) {
 	return res, nil
