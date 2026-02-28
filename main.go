@@ -88,6 +88,13 @@ func (p *PluginAlexaPlugin) OnReady() {
 	}()
 }
 
+func (p *PluginAlexaPlugin) OnShutdown() {
+	if p.cancel != nil {
+		p.cancel()
+		p.wg.Wait()
+	}
+}
+
 func (p *PluginAlexaPlugin) resolveConfig() AlexaPluginConfig {
 	cfg := AlexaPluginConfig{
 		WSEndpoint:   os.Getenv("ALEXA_WS_ENDPOINT"),
