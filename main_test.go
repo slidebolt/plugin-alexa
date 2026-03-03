@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
+	"testing"
+
 	"github.com/slidebolt/sdk-entities/light"
 	runner "github.com/slidebolt/sdk-runner"
-	"testing"
 )
 
 func TestAlexaDirectiveForwarding(t *testing.T) {
@@ -44,7 +46,9 @@ func TestAlexaDirectiveForwarding(t *testing.T) {
 		t.Errorf("unexpected target: %s/%s", evt.DeviceID, evt.EntityID)
 	}
 
-	if evt.Payload["type"] != light.ActionTurnOn {
-		t.Errorf("unexpected command payload: %v", evt.Payload)
+	var resPayload map[string]any
+	json.Unmarshal(evt.Payload, &resPayload)
+	if resPayload["type"] != light.ActionTurnOn {
+		t.Errorf("unexpected command payload: %v", resPayload)
 	}
 }

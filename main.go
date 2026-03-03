@@ -62,6 +62,7 @@ func (p *PluginAlexaPlugin) OnInitialize(config runner.Config, state types.Stora
 		ID:      "plugin-alexa",
 		Name:    "Alexa Bridge",
 		Version: "1.1.0",
+		Schemas: types.CoreDomains(),
 	}, state
 }
 
@@ -216,10 +217,11 @@ func (p *PluginAlexaPlugin) forwardDirectiveToTarget(proxy AlexaDeviceProxy, nam
 	if p.config.EventSink == nil {
 		return
 	}
-	err := p.config.EventSink.EmitTypedEvent(types.InboundEventTyped[types.GenericPayload]{
+	rawPayload, _ := json.Marshal(cmdPayload)
+	err := p.config.EventSink.EmitEvent(types.InboundEvent{
 		DeviceID: proxy.TargetDeviceID,
 		EntityID: proxy.TargetEntityID,
-		Payload:  types.GenericPayload(cmdPayload),
+		Payload:  json.RawMessage(rawPayload),
 	})
 	if err != nil {
 		fmt.Printf("[alexa] failed to emit directive event: %v\n", err)
@@ -260,7 +262,7 @@ func (p *PluginAlexaPlugin) OnDevicesList(current []types.Device) ([]types.Devic
 			SourceName: "Alexa Proxy Device",
 		})
 	}
-	return out, nil
+	return runner.EnsureCoreDevice("plugin-alexa", out), nil
 }
 func (p *PluginAlexaPlugin) OnDeviceSearch(q types.SearchQuery, res []types.Device) ([]types.Device, error) {
 	return res, nil
@@ -280,16 +282,20 @@ func (p *PluginAlexaPlugin) OnEntitiesList(d string, c []types.Entity) ([]types.
 			},
 		}, nil
 	}
-	return c, nil
+	return runner.EnsureCoreEntities("plugin-alexa", d, c), nil
 }
 
-func (p *PluginAlexaPlugin) OnCommandTyped(req types.CommandRequest[types.GenericPayload], entity types.Entity) (types.Entity, error) {
+func (p *PluginAlexaPlugin) OnCommand(req types.Command, entity types.Entity) (types.Entity, error) {
 	if entity.ID != "control" {
 		return entity, nil
 	}
-	action, _ := req.Payload["type"].(string)
+	var payload map[string]any
+	if err := json.Unmarshal(req.Payload, &payload); err != nil {
+		return entity, err
+	}
+	action, _ := payload["type"].(string)
 	if action == "add_device" {
-		p.handleAddDevice(req.Payload)
+		p.handleAddDevice(payload)
 	}
 	return entity, nil
 }
@@ -311,7 +317,7 @@ func (p *PluginAlexaPlugin) handleAddDevice(payload map[string]any) {
 	p.alexaDevices[id] = proxy
 }
 
-func (p *PluginAlexaPlugin) OnEventTyped(evt types.EventTyped[types.GenericPayload], entity types.Entity) (types.Entity, error) {
+func (p *PluginAlexaPlugin) OnEvent(evt types.Event, entity types.Entity) (types.Entity, error) {
 	// This hook is now used to receive all system events (as per TASK.md)
 	// We check if the event source matches any of our target entities.
 
@@ -326,8 +332,12 @@ func (p *PluginAlexaPlugin) OnEventTyped(evt types.EventTyped[types.GenericPaylo
 	p.mu.RUnlock()
 
 	if alexaDeviceID != "" && p.relay != nil && p.relay.IsConnected() {
+		var payload map[string]any
+		if err := json.Unmarshal(evt.Payload, &payload); err != nil {
+			return entity, err
+		}
 		// Translate event payload to Alexa state and push
-		alexaState := stateFromProps(evt.Payload)
+		alexaState := stateFromProps(payload)
 		if alexaState != nil {
 			msg := map[string]any{
 				"type": "alexaEvent",

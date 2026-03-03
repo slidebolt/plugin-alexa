@@ -11,10 +11,10 @@ import (
 
 // mockEventSink captures emitted events for verification
 type mockEventSink struct {
-	events []types.InboundEventTyped[types.GenericPayload]
+	events []types.InboundEvent
 }
 
-func (m *mockEventSink) EmitTypedEvent(evt types.InboundEventTyped[types.GenericPayload]) error {
+func (m *mockEventSink) EmitEvent(evt types.InboundEvent) error {
 	m.events = append(m.events, evt)
 	return nil
 }
@@ -31,15 +31,15 @@ func TestCreateAlexaDevice(t *testing.T) {
 		"target_device_id": "test-device",
 		"target_entity_id": "test-entity",
 	}
+	raw, _ := json.Marshal(payload)
 	// 1. Send add_device command to control entity
-	_, err := p.OnCommandTyped(types.CommandRequest[types.GenericPayload]{
-		CommandID: "cmd-1",
-		Entity:    types.Entity{ID: "control"},
-		Payload:   types.GenericPayload(payload),
+	_, err := p.OnCommand(types.Command{
+		ID:      "cmd-1",
+		Payload: json.RawMessage(raw),
 	}, types.Entity{ID: "control"})
 
 	if err != nil {
-		t.Fatalf("OnCommandTyped failed: %v", err)
+		t.Fatalf("OnCommand failed: %v", err)
 	}
 
 	// 2. Validate device exists in list
@@ -110,7 +110,9 @@ func TestAlexaCommunication(t *testing.T) {
 		t.Errorf("event target mismatch: got %s/%s, want %s/%s", evt.DeviceID, evt.EntityID, targetDeviceID, targetEntityID)
 	}
 
-	if evt.Payload["type"] != light.ActionTurnOn {
-		t.Errorf("event payload mismatch: got %v, want %s", evt.Payload["type"], light.ActionTurnOn)
+	var payload map[string]any
+	json.Unmarshal(evt.Payload, &payload)
+	if payload["type"] != light.ActionTurnOn {
+		t.Errorf("event payload mismatch: got %v, want %s", payload["type"], light.ActionTurnOn)
 	}
 }
