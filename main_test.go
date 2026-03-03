@@ -1,40 +1,24 @@
 package main
 
 import (
-	"encoding/json"
-	"os"
-	"testing"
-	"time"
-
-	"github.com/nats-io/nats.go"
 	"github.com/slidebolt/sdk-entities/light"
-	"github.com/slidebolt/sdk-types"
+	runner "github.com/slidebolt/sdk-runner"
+	"testing"
 )
 
 func TestAlexaDirectiveForwarding(t *testing.T) {
+	sink := &mockEventSink{}
 	p := &PluginAlexaPlugin{
 		alexaDevices: make(map[string]AlexaDeviceProxy),
+		config:       runner.Config{EventSink: sink},
 	}
 	p.factory = NewAlexaEventFactory()
-	
+
 	p.alexaDevices["alexa-device-1"] = AlexaDeviceProxy{
 		TargetPluginID: "target-plugin",
 		TargetDeviceID: "target-device",
 		TargetEntityID: "target-entity",
 	}
-
-	natsURL := os.Getenv("NATS_URL")
-	if natsURL == "" {
-		natsURL = "nats://127.0.0.1:4222"
-	}
-	nc, err := nats.Connect(natsURL)
-	if err != nil {
-		t.Skip("NATS not available")
-	}
-	defer nc.Close()
-	// p.nc removed as it is no longer a field in PluginAlexaPlugin
-
-	sub, _ := nc.SubscribeSync("slidebolt.rpc.target-plugin")
 
 	payload := map[string]any{
 		"type": "alexaDirective",
@@ -52,30 +36,15 @@ func TestAlexaDirectiveForwarding(t *testing.T) {
 
 	p.handleRelayMessage(payload)
 
-	msg, err := sub.NextMsg(2 * time.Second)
-	if err != nil {
-		t.Fatalf("did not receive NATS message: %v", err)
+	if len(sink.events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(sink.events))
+	}
+	evt := sink.events[0]
+	if evt.DeviceID != "target-device" || evt.EntityID != "target-entity" {
+		t.Errorf("unexpected target: %s/%s", evt.DeviceID, evt.EntityID)
 	}
 
-	var req types.Request
-	json.Unmarshal(msg.Data, &req)
-	if req.Method != "entities/commands/create" {
-		t.Errorf("unexpected method: %s", req.Method)
-	}
-
-	var params struct {
-		DeviceID string          `json:"device_id"`
-		EntityID string          `json:"entity_id"`
-		Payload  json.RawMessage `json:"payload"`
-	}
-	json.Unmarshal(req.Params, &params)
-	if params.DeviceID != "target-device" || params.EntityID != "target-entity" {
-		t.Errorf("unexpected target: %v", params)
-	}
-
-	var cmdPayload map[string]any
-	json.Unmarshal(params.Payload, &cmdPayload)
-	if cmdPayload["type"] != light.ActionTurnOn {
-		t.Errorf("unexpected command payload: %v", cmdPayload)
+	if evt.Payload["type"] != light.ActionTurnOn {
+		t.Errorf("unexpected command payload: %v", evt.Payload)
 	}
 }

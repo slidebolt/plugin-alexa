@@ -30,3 +30,14 @@ The workflow is as follows:
 #### Available Commands
 
 This plugin primarily acts as a translator and does not directly control devices. It listens for Alexa directives and converts them into Slidebolt events. It also exposes a special `control` device that can be used to programmatically add or remove which Slidebolt devices are exposed to Alexa.
+
+#### Standalone Discovery Mode
+
+This plugin supports a standalone discovery mode for rapid testing and diagnostics without requiring the full Slidebolt stack (NATS, Gateway, etc.).
+
+To run discovery and output the results to JSON:
+```bash
+./plugin-alexa -discover
+```
+
+**Note**: Ensure any required environment variables (e.g., API keys, URLs) are set before running.

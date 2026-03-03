@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/slidebolt/sdk-entities/light"
 	runner "github.com/slidebolt/sdk-runner"
 	"github.com/slidebolt/sdk-types"
-	"github.com/slidebolt/sdk-entities/light"
 )
 
 type PluginAlexaPlugin struct {
@@ -86,6 +86,10 @@ func (p *PluginAlexaPlugin) OnReady() {
 		defer p.wg.Done()
 		p.relay.RunLoop(p.ctx)
 	}()
+}
+
+func (p *PluginAlexaPlugin) WaitReady(ctx context.Context) error {
+	return nil
 }
 
 func (p *PluginAlexaPlugin) OnShutdown() {
@@ -209,11 +213,13 @@ func (p *PluginAlexaPlugin) forwardDirectiveToTarget(proxy AlexaDeviceProxy, nam
 
 	// We use the SDK's EventSink to emit an event representing the directive.
 	// This event can be observed by other plugins or used to trigger automations.
-	body, _ := json.Marshal(cmdPayload)
-	err := p.config.EventSink.EmitEvent(types.InboundEvent{
+	if p.config.EventSink == nil {
+		return
+	}
+	err := p.config.EventSink.EmitTypedEvent(types.InboundEventTyped[types.GenericPayload]{
 		DeviceID: proxy.TargetDeviceID,
 		EntityID: proxy.TargetEntityID,
-		Payload:  body,
+		Payload:  types.GenericPayload(cmdPayload),
 	})
 	if err != nil {
 		fmt.Printf("[alexa] failed to emit directive event: %v\n", err)
@@ -227,7 +233,7 @@ func (p *PluginAlexaPlugin) OnHealthCheck() (string, error) {
 func (p *PluginAlexaPlugin) OnStorageUpdate(current types.Storage) (types.Storage, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	
+
 	data, _ := json.Marshal(map[string]any{"devices": p.alexaDevices})
 	p.storage.Data = data
 	return p.storage, nil
@@ -277,14 +283,13 @@ func (p *PluginAlexaPlugin) OnEntitiesList(d string, c []types.Entity) ([]types.
 	return c, nil
 }
 
-func (p *PluginAlexaPlugin) OnCommand(cmd types.Command, entity types.Entity) (types.Entity, error) {
-	if entity.ID == "control" {
-		var payload map[string]any
-		json.Unmarshal(cmd.Payload, &payload)
-		action, _ := payload["type"].(string)
-		if action == "add_device" {
-			p.handleAddDevice(payload)
-		}
+func (p *PluginAlexaPlugin) OnCommandTyped(req types.CommandRequest[types.GenericPayload], entity types.Entity) (types.Entity, error) {
+	if entity.ID != "control" {
+		return entity, nil
+	}
+	action, _ := req.Payload["type"].(string)
+	if action == "add_device" {
+		p.handleAddDevice(req.Payload)
 	}
 	return entity, nil
 }
@@ -292,10 +297,12 @@ func (p *PluginAlexaPlugin) OnCommand(cmd types.Command, entity types.Entity) (t
 func (p *PluginAlexaPlugin) handleAddDevice(payload map[string]any) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	id, _ := payload["id"].(string)
-	if id == "" { return }
-	
+	if id == "" {
+		return
+	}
+
 	proxy := AlexaDeviceProxy{
 		TargetPluginID: asString(payload["target_plugin_id"]),
 		TargetDeviceID: asString(payload["target_device_id"]),
@@ -304,10 +311,10 @@ func (p *PluginAlexaPlugin) handleAddDevice(payload map[string]any) {
 	p.alexaDevices[id] = proxy
 }
 
-func (p *PluginAlexaPlugin) OnEvent(evt types.Event, entity types.Entity) (types.Entity, error) {
+func (p *PluginAlexaPlugin) OnEventTyped(evt types.EventTyped[types.GenericPayload], entity types.Entity) (types.Entity, error) {
 	// This hook is now used to receive all system events (as per TASK.md)
 	// We check if the event source matches any of our target entities.
-	
+
 	p.mu.RLock()
 	var alexaDeviceID string
 	for id, proxy := range p.alexaDevices {
@@ -320,35 +327,32 @@ func (p *PluginAlexaPlugin) OnEvent(evt types.Event, entity types.Entity) (types
 
 	if alexaDeviceID != "" && p.relay != nil && p.relay.IsConnected() {
 		// Translate event payload to Alexa state and push
-		var payload map[string]any
-		if err := json.Unmarshal(evt.Payload, &payload); err == nil {
-			alexaState := stateFromProps(payload)
-			if alexaState != nil {
-				msg := map[string]any{
-					"type": "alexaEvent",
-					"event": map[string]any{
-						"header": map[string]any{
-							"namespace":      "Alexa",
-							"name":           "ChangeReport",
-							"messageId":      fmt.Sprintf("%d", time.Now().UnixNano()),
-							"payloadVersion": "3",
-						},
-						"endpoint": map[string]any{
-							"endpointId": alexaDeviceID,
-						},
-						"payload": map[string]any{
-							"change": map[string]any{
-								"cause": map[string]any{"type": "PHYSICAL_INTERACTION"},
-								"properties": alexaState["properties"],
-							},
+		alexaState := stateFromProps(evt.Payload)
+		if alexaState != nil {
+			msg := map[string]any{
+				"type": "alexaEvent",
+				"event": map[string]any{
+					"header": map[string]any{
+						"namespace":      "Alexa",
+						"name":           "ChangeReport",
+						"messageId":      fmt.Sprintf("%d", time.Now().UnixNano()),
+						"payloadVersion": "3",
+					},
+					"endpoint": map[string]any{
+						"endpointId": alexaDeviceID,
+					},
+					"payload": map[string]any{
+						"change": map[string]any{
+							"cause":      map[string]any{"type": "PHYSICAL_INTERACTION"},
+							"properties": alexaState["properties"],
 						},
 					},
-				}
-				p.relay.WriteJSON(msg)
+				},
 			}
+			p.relay.WriteJSON(msg)
 		}
 	}
-	
+
 	return entity, nil
 }
 
