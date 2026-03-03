@@ -363,7 +363,11 @@ func asString(v any) string {
 
 func main() {
 	plugin := &PluginAlexaPlugin{}
-	if err := runner.NewRunner(plugin).Run(); err != nil {
+	r, err := runner.NewRunner(plugin)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := r.Run(); err != nil {
 		log.Fatal(err)
 	}
 }
