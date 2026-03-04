@@ -4,7 +4,6 @@ go 1.25.7
 
 require (
 	github.com/gorilla/websocket v1.5.3
-	github.com/nats-io/nats.go v1.49.0
 	github.com/slidebolt/sdk-entities v1.4.1
 	github.com/slidebolt/sdk-runner v1.6.1
 	github.com/slidebolt/sdk-types v1.5.3
@@ -12,6 +11,7 @@ require (
 
 require (
 	github.com/klauspost/compress v1.18.4 // indirect
+	github.com/nats-io/nats.go v1.49.0 // indirect
 	github.com/nats-io/nkeys v0.4.15 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
