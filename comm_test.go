@@ -116,3 +116,32 @@ func TestAlexaCommunication(t *testing.T) {
 		t.Errorf("event payload mismatch: got %v, want %s", payload["type"], light.ActionTurnOn)
 	}
 }
+
+func TestOnDevicesList_DoesNotDuplicateControlDevice(t *testing.T) {
+	p := &PluginAlexaPlugin{}
+	_, _ = p.OnInitialize(runner.Config{}, types.Storage{})
+
+	// Simulate persisted state where control already exists.
+	current := []types.Device{
+		{
+			ID:         "control",
+			SourceID:   "alexa-control",
+			SourceName: "Alexa Control",
+		},
+	}
+
+	devices, err := p.OnDevicesList(current)
+	if err != nil {
+		t.Fatalf("OnDevicesList failed: %v", err)
+	}
+
+	controlCount := 0
+	for _, d := range devices {
+		if d.ID == "control" {
+			controlCount++
+		}
+	}
+	if controlCount != 1 {
+		t.Fatalf("expected exactly one control device, got %d (devices=%v)", controlCount, devices)
+	}
+}

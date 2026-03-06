@@ -245,22 +245,31 @@ func (p *PluginAlexaPlugin) OnDeviceCreate(dev types.Device) (types.Device, erro
 func (p *PluginAlexaPlugin) OnDeviceUpdate(dev types.Device) (types.Device, error) { return dev, nil }
 func (p *PluginAlexaPlugin) OnDeviceDelete(id string) error                        { return nil }
 func (p *PluginAlexaPlugin) OnDevicesList(current []types.Device) ([]types.Device, error) {
-	// Always include the control device
-	control := types.Device{
+	byID := make(map[string]types.Device, len(current)+2)
+	for _, d := range current {
+		byID[d.ID] = d
+	}
+
+	// Always include/refresh the control device
+	byID["control"] = runner.ReconcileDevice(byID["control"], types.Device{
 		ID:         "control",
 		SourceID:   "alexa-control",
 		SourceName: "Alexa Control",
-	}
-	out := append(current, control)
+	})
 
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for id := range p.alexaDevices {
-		out = append(out, types.Device{
+		byID[id] = runner.ReconcileDevice(byID[id], types.Device{
 			ID:         id,
 			SourceID:   id,
 			SourceName: "Alexa Proxy Device",
 		})
+	}
+
+	out := make([]types.Device, 0, len(byID))
+	for _, d := range byID {
+		out = append(out, d)
 	}
 	return runner.EnsureCoreDevice("plugin-alexa", out), nil
 }
