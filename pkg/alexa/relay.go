@@ -1,4 +1,4 @@
-package main
+package alexa
 
 import (
 	"context"
@@ -6,55 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-const (
-	wsWriteTimeout  = 5 * time.Second
-	wsPongWait      = 5 * time.Minute
-	wsPingPeriod    = 2 * time.Minute
-	registerAckWait = 10 * time.Second
-)
-
-// Logger is the logging interface the relay uses.
-type Logger interface {
-	Info(format string, args ...interface{})
-	Warn(format string, args ...interface{})
-	Error(format string, args ...interface{})
-}
-
-type DefaultLogger struct{}
-
-func (l DefaultLogger) Info(format string, args ...interface{}) {
-	fmt.Printf("[INFO] "+format+"\n", args...)
-}
-func (l DefaultLogger) Warn(format string, args ...interface{}) {
-	fmt.Printf("[WARN] "+format+"\n", args...)
-}
-func (l DefaultLogger) Error(format string, args ...interface{}) {
-	fmt.Printf("[ERROR] "+format+"\n", args...)
-}
-
-// RelayClient manages the WebSocket connection to the Alexa relay service.
-type RelayClient struct {
-	endpoint    string
-	secret      string
-	clientID    string
-	logger      Logger
-	onMessage   func(map[string]any)
-	onConnected func()
-
-	connected atomic.Bool
-
-	mu      sync.Mutex
-	conn    *websocket.Conn
-	writeMu sync.Mutex
-}
-
+// NewRelayClient creates a new RelayClient instance.
 func NewRelayClient(
 	endpoint, secret, clientID string,
 	logger Logger,
@@ -74,10 +31,12 @@ func NewRelayClient(
 	}
 }
 
+// IsConnected returns whether the relay is currently connected.
 func (r *RelayClient) IsConnected() bool {
 	return r.connected.Load()
 }
 
+// RunLoop runs the connection loop with exponential backoff.
 func (r *RelayClient) RunLoop(ctx context.Context) {
 	backoff := time.Second
 	for {
@@ -106,7 +65,7 @@ func (r *RelayClient) RunLoop(ctx context.Context) {
 }
 
 func (r *RelayClient) connectOnce(ctx context.Context) error {
-	r.logger.Info("[alexa-relay] connecting to %s", redactConnectToken(r.endpoint))
+	r.logger.Info("[alexa-relay] connecting to %s", RedactConnectToken(r.endpoint))
 
 	dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer dialCancel()
@@ -121,7 +80,7 @@ func (r *RelayClient) connectOnce(ctx context.Context) error {
 	}
 
 	conn.SetReadLimit(512 * 1024)
-	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	_ = conn.SetReadDeadline(time.Now().Add(WSPongWait))
 
 	r.mu.Lock()
 	r.conn = conn
@@ -171,7 +130,7 @@ func (r *RelayClient) connectOnce(ctx context.Context) error {
 }
 
 func (r *RelayClient) pingLoop(ctx context.Context, conn *websocket.Conn, done <-chan struct{}) {
-	ticker := time.NewTicker(wsPingPeriod)
+	ticker := time.NewTicker(WSPingPeriod)
 	defer ticker.Stop()
 	for {
 		select {
@@ -181,7 +140,7 @@ func (r *RelayClient) pingLoop(ctx context.Context, conn *websocket.Conn, done <
 			return
 		case <-ticker.C:
 			r.writeMu.Lock()
-			_ = conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+			_ = conn.SetWriteDeadline(time.Now().Add(WSWriteTimeout))
 			_ = conn.WriteJSON(map[string]any{"action": "keepalive"})
 			r.writeMu.Unlock()
 		}
@@ -203,7 +162,7 @@ func (r *RelayClient) readLoop(ctx context.Context, conn *websocket.Conn) {
 			}
 			return
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+		_ = conn.SetReadDeadline(time.Now().Add(WSPongWait))
 		if msgType == websocket.TextMessage {
 			var payload map[string]any
 			if json.Unmarshal(msg, &payload) == nil && r.onMessage != nil {
@@ -222,13 +181,13 @@ func (r *RelayClient) sendRegister() error {
 }
 
 func (r *RelayClient) waitForRegisterAck(ctx context.Context, conn *websocket.Conn) error {
-	deadline := time.Now().Add(registerAckWait)
+	deadline := time.Now().Add(RegisterAckWait)
 	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
 		deadline = dl
 	}
 	_ = conn.SetReadDeadline(deadline)
 	defer func() {
-		_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+		_ = conn.SetReadDeadline(time.Now().Add(WSPongWait))
 	}()
 
 	for {
@@ -266,6 +225,7 @@ func (r *RelayClient) waitForRegisterAck(ctx context.Context, conn *websocket.Co
 	}
 }
 
+// WriteJSON writes a JSON message to the WebSocket connection.
 func (r *RelayClient) WriteJSON(v any) error {
 	if !r.connected.Load() {
 		return fmt.Errorf("not registered")
@@ -284,10 +244,11 @@ func (r *RelayClient) writeJSON(v any) error {
 	if conn == nil {
 		return fmt.Errorf("not connected")
 	}
-	_ = conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+	_ = conn.SetWriteDeadline(time.Now().Add(WSWriteTimeout))
 	return conn.WriteJSON(v)
 }
 
+// Close closes the WebSocket connection.
 func (r *RelayClient) Close() {
 	r.mu.Lock()
 	conn := r.conn
@@ -299,7 +260,7 @@ func (r *RelayClient) Close() {
 		_ = conn.WriteControl(
 			websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "shutdown"),
-			time.Now().Add(wsWriteTimeout),
+			time.Now().Add(WSWriteTimeout),
 		)
 		r.writeMu.Unlock()
 		_ = conn.Close()
@@ -307,7 +268,8 @@ func (r *RelayClient) Close() {
 	r.connected.Store(false)
 }
 
-func redactConnectToken(endpoint string) string {
+// RedactConnectToken redacts the connect token in a URL for logging.
+func RedactConnectToken(endpoint string) string {
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return endpoint

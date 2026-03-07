@@ -4,23 +4,31 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/slidebolt/plugin-alexa/pkg/alexa"
 	"github.com/slidebolt/sdk-entities/light"
 	runner "github.com/slidebolt/sdk-runner"
+	"github.com/slidebolt/sdk-types"
 )
 
 func TestAlexaDirectiveForwarding(t *testing.T) {
 	sink := &mockEventSink{}
-	p := &PluginAlexaPlugin{
-		alexaDevices: make(map[string]AlexaDeviceProxy),
-		config:       runner.Config{EventSink: sink},
-	}
-	p.factory = NewAlexaEventFactory()
 
-	p.alexaDevices["alexa-device-1"] = AlexaDeviceProxy{
-		TargetPluginID: "target-plugin",
-		TargetDeviceID: "target-device",
-		TargetEntityID: "target-entity",
+	// Setup storage with Alexa proxy mapping in RawStore
+	storageData, _ := json.Marshal(map[string]any{
+		"devices": map[string]alexa.AlexaDeviceProxy{
+			"alexa-device-1": {
+				TargetPluginID: "target-plugin",
+				TargetDeviceID: "target-device",
+				TargetEntityID: "target-entity",
+			},
+		},
+	})
+
+	p := &PluginAdapter{
+		config: runner.Config{EventSink: sink},
 	}
+	p.storage = types.Storage{Data: storageData}
+	p.factory = alexa.NewEventFactory()
 
 	payload := map[string]any{
 		"type": "alexaDirective",

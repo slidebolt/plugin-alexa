@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/slidebolt/plugin-alexa/pkg/alexa"
 	"github.com/slidebolt/sdk-entities/light"
 	"github.com/slidebolt/sdk-runner"
 	"github.com/slidebolt/sdk-types"
@@ -20,7 +21,7 @@ func (m *mockEventSink) EmitEvent(evt types.InboundEvent) error {
 }
 
 func TestCreateAlexaDevice(t *testing.T) {
-	p := &PluginAlexaPlugin{}
+	p := &PluginAdapter{}
 	_, _ = p.OnInitialize(runner.Config{}, types.Storage{})
 
 	proxyID := "test-alexa-1"
@@ -55,10 +56,12 @@ func TestCreateAlexaDevice(t *testing.T) {
 		t.Error("created alexa device not found in OnDevicesList")
 	}
 
-	// 3. Validate persistence via OnStorageUpdate
-	storage, _ := p.OnStorageUpdate(types.Storage{})
+	// 3. Validate persistence via OnStorageUpdate (simulating SDK behavior)
+	// The plugin should marshal its state into the provided storage
+	currentStorage := types.Storage{}
+	storage, _ := p.OnStorageUpdate(currentStorage)
 	var data struct {
-		Devices map[string]AlexaDeviceProxy `json:"devices"`
+		Devices map[string]alexa.AlexaDeviceProxy `json:"devices"`
 	}
 	json.Unmarshal(storage.Data, &data)
 	if _, ok := data.Devices[proxyID]; !ok {
@@ -68,20 +71,26 @@ func TestCreateAlexaDevice(t *testing.T) {
 
 func TestAlexaCommunication(t *testing.T) {
 	sink := &mockEventSink{}
-	p := &PluginAlexaPlugin{
-		config:       runner.Config{EventSink: sink},
-		alexaDevices: make(map[string]AlexaDeviceProxy),
-	}
 
+	// Setup storage with Alexa proxy mapping in RawStore
 	proxyID := "alexa-device-1"
 	targetDeviceID := "target-device"
 	targetEntityID := "target-entity"
 
-	p.alexaDevices[proxyID] = AlexaDeviceProxy{
-		TargetPluginID: "target-plugin",
-		TargetDeviceID: targetDeviceID,
-		TargetEntityID: targetEntityID,
+	storageData, _ := json.Marshal(map[string]any{
+		"devices": map[string]alexa.AlexaDeviceProxy{
+			proxyID: {
+				TargetPluginID: "target-plugin",
+				TargetDeviceID: targetDeviceID,
+				TargetEntityID: targetEntityID,
+			},
+		},
+	})
+
+	p := &PluginAdapter{
+		config: runner.Config{EventSink: sink},
 	}
+	p.storage = types.Storage{Data: storageData}
 
 	// Simulate an Alexa directive (TurnOn)
 	directive := map[string]any{
@@ -118,7 +127,7 @@ func TestAlexaCommunication(t *testing.T) {
 }
 
 func TestOnDevicesList_DoesNotDuplicateControlDevice(t *testing.T) {
-	p := &PluginAlexaPlugin{}
+	p := &PluginAdapter{}
 	_, _ = p.OnInitialize(runner.Config{}, types.Storage{})
 
 	// Simulate persisted state where control already exists.
@@ -143,5 +152,92 @@ func TestOnDevicesList_DoesNotDuplicateControlDevice(t *testing.T) {
 	}
 	if controlCount != 1 {
 		t.Fatalf("expected exactly one control device, got %d (devices=%v)", controlCount, devices)
+	}
+}
+
+func TestAlexaErrorStatusMapping(t *testing.T) {
+	p := &PluginAdapter{}
+	_, _ = p.OnInitialize(runner.Config{}, types.Storage{})
+
+	tests := []struct {
+		name           string
+		payload        map[string]any
+		wantSyncStatus types.SyncStatus
+		wantErr        bool
+	}{
+		{
+			name: "successful command sets synced",
+			payload: map[string]any{
+				"type": "add_device",
+				"id":   "test-device-1",
+			},
+			wantSyncStatus: types.SyncStatusSynced,
+			wantErr:        false,
+		},
+		{
+			name: "invalid json sets failed",
+			payload: map[string]any{
+				"type": "add_device",
+				"id":   "test-device-2",
+			},
+			wantSyncStatus: types.SyncStatusFailed,
+			wantErr:        true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var raw []byte
+			var err error
+
+			if tt.wantErr && tt.name == "invalid json sets failed" {
+				// Create invalid JSON
+				raw = []byte(`{invalid json}`)
+			} else {
+				raw, _ = json.Marshal(tt.payload)
+			}
+
+			entity, err := p.OnCommand(types.Command{
+				ID:      "cmd-test",
+				Payload: json.RawMessage(raw),
+			}, types.Entity{ID: "control"})
+
+			if tt.wantErr && err == nil {
+				t.Errorf("expected error but got none")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+
+			if entity.Data.SyncStatus != tt.wantSyncStatus {
+				t.Errorf("sync_status = %v, want %v", entity.Data.SyncStatus, tt.wantSyncStatus)
+			}
+		})
+	}
+}
+
+func TestSyncStatusStandards(t *testing.T) {
+	// Verify the correct standard values are used
+	if alexa.SyncStatusSynced != "synced" {
+		t.Errorf("SyncStatusSynced = %v, want 'synced'", alexa.SyncStatusSynced)
+	}
+	if alexa.SyncStatusPending != "pending" {
+		t.Errorf("SyncStatusPending = %v, want 'pending'", alexa.SyncStatusPending)
+	}
+	if alexa.SyncStatusFailed != "failed" {
+		t.Errorf("SyncStatusFailed = %v, want 'failed'", alexa.SyncStatusFailed)
+	}
+	if alexa.SyncStatusEmpty != "" {
+		t.Errorf("SyncStatusEmpty = %v, want ''", alexa.SyncStatusEmpty)
+	}
+
+	// Verify we don't use non-standard values
+	invalidStatuses := []string{"in_sync", "ok", "error"}
+	for _, status := range invalidStatuses {
+		if status == alexa.SyncStatusSynced ||
+			status == alexa.SyncStatusPending ||
+			status == alexa.SyncStatusFailed {
+			t.Errorf("non-standard status '%s' should not be a constant", status)
+		}
 	}
 }
