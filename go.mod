@@ -5,8 +5,8 @@ go 1.25.7
 require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/slidebolt/sdk-entities v1.20.0
-	github.com/slidebolt/sdk-runner v1.20.0
-	github.com/slidebolt/sdk-types v1.20.0
+	github.com/slidebolt/sdk-runner v1.20.1
+	github.com/slidebolt/sdk-types v1.20.1
 )
 
 require (
