@@ -44,7 +44,7 @@ func TestCreateAlexaDevice(t *testing.T) {
 	}
 
 	// 2. Validate device exists in list
-	devices, _ := p.OnDevicesList([]types.Device{})
+	devices, _ := p.OnDeviceDiscover([]types.Device{})
 	found := false
 	for _, d := range devices {
 		if d.ID == proxyID {
@@ -53,13 +53,13 @@ func TestCreateAlexaDevice(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Error("created alexa device not found in OnDevicesList")
+		t.Error("created alexa device not found in OnDeviceDiscover")
 	}
 
-	// 3. Validate persistence via OnStorageUpdate (simulating SDK behavior)
+	// 3. Validate persistence via OnConfigUpdate (simulating SDK behavior)
 	// The plugin should marshal its state into the provided storage
 	currentStorage := types.Storage{}
-	storage, _ := p.OnStorageUpdate(currentStorage)
+	storage, _ := p.OnConfigUpdate(currentStorage)
 	var data struct {
 		Devices map[string]alexa.AlexaDeviceProxy `json:"devices"`
 	}
@@ -126,7 +126,7 @@ func TestAlexaCommunication(t *testing.T) {
 	}
 }
 
-func TestOnDevicesList_DoesNotDuplicateControlDevice(t *testing.T) {
+func TestOnDeviceDiscover_DoesNotDuplicateControlDevice(t *testing.T) {
 	p := &PluginAdapter{}
 	_, _ = p.OnInitialize(runner.Config{}, types.Storage{})
 
@@ -139,9 +139,9 @@ func TestOnDevicesList_DoesNotDuplicateControlDevice(t *testing.T) {
 		},
 	}
 
-	devices, err := p.OnDevicesList(current)
+	devices, err := p.OnDeviceDiscover(current)
 	if err != nil {
-		t.Fatalf("OnDevicesList failed: %v", err)
+		t.Fatalf("OnDeviceDiscover failed: %v", err)
 	}
 
 	controlCount := 0

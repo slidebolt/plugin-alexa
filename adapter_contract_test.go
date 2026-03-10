@@ -8,7 +8,7 @@ import (
 	"github.com/slidebolt/sdk-types"
 )
 
-func TestOnDevicesList_AllIDsRemainStrings(t *testing.T) {
+func TestOnDeviceDiscover_AllIDsRemainStrings(t *testing.T) {
 	p := &PluginAdapter{}
 
 	storageData, err := json.Marshal(map[string]any{
@@ -25,9 +25,9 @@ func TestOnDevicesList_AllIDsRemainStrings(t *testing.T) {
 	}
 	p.storage = types.Storage{Data: storageData}
 
-	devices, err := p.OnDevicesList(nil)
+	devices, err := p.OnDeviceDiscover(nil)
 	if err != nil {
-		t.Fatalf("OnDevicesList failed: %v", err)
+		t.Fatalf("OnDeviceDiscover failed: %v", err)
 	}
 	if len(devices) == 0 {
 		t.Fatal("expected at least one device")
@@ -39,7 +39,7 @@ func TestOnDevicesList_AllIDsRemainStrings(t *testing.T) {
 	}
 }
 
-func TestOnEntitiesList_PreservesCapabilityEntitiesAndAvailability(t *testing.T) {
+func TestOnEntityDiscover_PreservesCapabilityEntitiesAndAvailability(t *testing.T) {
 	p := &PluginAdapter{}
 
 	storageData, err := json.Marshal(map[string]any{
@@ -62,9 +62,9 @@ func TestOnEntitiesList_PreservesCapabilityEntitiesAndAvailability(t *testing.T)
 		{ID: "cover-1", DeviceID: "proxy-1", Domain: "cover", Actions: []string{"open", "close", "set_position"}},
 	}
 
-	entities, err := p.OnEntitiesList("proxy-1", current)
+	entities, err := p.OnEntityDiscover("proxy-1", current)
 	if err != nil {
-		t.Fatalf("OnEntitiesList failed: %v", err)
+		t.Fatalf("OnEntityDiscover failed: %v", err)
 	}
 
 	byID := map[string]types.Entity{}

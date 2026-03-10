@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -29,6 +30,7 @@ type PluginAdapter struct {
 
 	// relayConnected tracks if the relay is currently connected
 	relayConnected bool
+	registryCache  runner.RegistryCache
 }
 
 // AlexaPluginConfig holds the plugin configuration
@@ -44,6 +46,7 @@ func (p *PluginAdapter) OnInitialize(config runner.Config, state types.Storage) 
 	p.config = config
 	p.storage = state
 	p.factory = alexa.NewEventFactory()
+	p.registryCache = config.RegistryCache
 
 	return types.Manifest{
 		ID:      "plugin-alexa",
@@ -271,8 +274,8 @@ func (p *PluginAdapter) OnHealthCheck() (string, error) {
 	return "perfect", nil
 }
 
-// OnStorageUpdate handles storage updates.
-func (p *PluginAdapter) OnStorageUpdate(current types.Storage) (types.Storage, error) {
+// OnConfigUpdate handles storage updates.
+func (p *PluginAdapter) OnConfigUpdate(current types.Storage) (types.Storage, error) {
 	// RawStore pattern: ensure storage.Data contains the Alexa proxy metadata
 	// The plugin state is already in p.storage.Data from handleAddDevice
 	// We need to merge it into the current storage being persisted
@@ -292,8 +295,8 @@ func (p *PluginAdapter) OnDeviceUpdate(dev types.Device) (types.Device, error) {
 // OnDeviceDelete handles device deletion.
 func (p *PluginAdapter) OnDeviceDelete(id string) error { return nil }
 
-// OnDevicesList lists all devices.
-func (p *PluginAdapter) OnDevicesList(current []types.Device) ([]types.Device, error) {
+// OnDeviceDiscover lists all devices.
+func (p *PluginAdapter) OnDeviceDiscover(current []types.Device) ([]types.Device, error) {
 	byID := make(map[string]types.Device, len(current)+2)
 	for _, d := range current {
 		byID[d.ID] = d
@@ -346,17 +349,19 @@ func (p *PluginAdapter) OnEntityUpdate(e types.Entity) (types.Entity, error) { r
 // OnEntityDelete handles entity deletion.
 func (p *PluginAdapter) OnEntityDelete(d, e string) error { return nil }
 
-// OnEntitiesList lists all entities for a device.
-func (p *PluginAdapter) OnEntitiesList(d string, c []types.Entity) ([]types.Entity, error) {
+// OnEntityDiscover lists all entities for a device.
+func (p *PluginAdapter) OnEntityDiscover(d string, c []types.Entity) ([]types.Entity, error) {
 	if d == "control" {
-		return []types.Entity{
+		base := []types.Entity{
 			{
 				ID:        "control",
 				DeviceID:  "control",
 				Domain:    "switch",
 				LocalName: "Alexa Control",
 			},
-		}, nil
+		}
+		base = append(base, p.buildAutoMirrorsForControl()...)
+		return base, nil
 	}
 
 	// Add availability entity for Alexa proxy devices
@@ -396,6 +401,74 @@ func (p *PluginAdapter) OnEntitiesList(d string, c []types.Entity) ([]types.Enti
 	}
 
 	return runner.EnsureCoreEntities("plugin-alexa", d, c), nil
+}
+
+func (p *PluginAdapter) buildAutoMirrorsForControl() []types.Entity {
+	if p.registryCache == nil {
+		return nil
+	}
+	matches, err := p.registryCache.FindEntities(types.SearchQuery{Pattern: "*"})
+	if err != nil {
+		return nil
+	}
+
+	out := make([]types.Entity, 0)
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].PluginID != matches[j].PluginID {
+			return matches[i].PluginID < matches[j].PluginID
+		}
+		if matches[i].DeviceID != matches[j].DeviceID {
+			return matches[i].DeviceID < matches[j].DeviceID
+		}
+		return matches[i].ID < matches[j].ID
+	})
+
+	for _, m := range matches {
+		// Avoid mirroring Alexa control entities into themselves.
+		if m.PluginID == "plugin-alexa" && m.DeviceID == "control" {
+			continue
+		}
+		if !hasLabelValue(m.Labels, "PluginAlexa", "Enabled") {
+			continue
+		}
+		labels := copyLabels(m.Labels)
+		labels["MirrorSource"] = []string{fmt.Sprintf("%s/%s/%s", m.PluginID, m.DeviceID, m.ID)}
+
+		out = append(out, types.Entity{
+			ID:        fmt.Sprintf("mirror-%s-%s-%s", m.PluginID, m.DeviceID, m.ID),
+			DeviceID:  "control",
+			Domain:    m.Domain,
+			LocalName: m.LocalName,
+			Actions:   append([]string(nil), m.Actions...),
+			Labels:    labels,
+			Data:      m.Data,
+		})
+	}
+	return out
+}
+
+func hasLabelValue(labels map[string][]string, key, want string) bool {
+	if labels == nil {
+		return false
+	}
+	vals := labels[key]
+	for _, v := range vals {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+func copyLabels(in map[string][]string) map[string][]string {
+	if in == nil {
+		return map[string][]string{}
+	}
+	out := make(map[string][]string, len(in))
+	for k, vals := range in {
+		out[k] = append([]string(nil), vals...)
+	}
+	return out
 }
 
 // OnCommand handles commands for entities.
