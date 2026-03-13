@@ -22,7 +22,7 @@ func (m *mockEventSink) EmitEvent(evt types.InboundEvent) error {
 
 func TestCreateAlexaDevice(t *testing.T) {
 	p := &PluginAdapter{}
-	_, _ = p.OnInitialize(runner.Config{}, types.Storage{})
+	_, _ = p.OnInitialize(testConfig{}, types.Storage{})
 
 	proxyID := "test-alexa-1"
 	payload := map[string]any{
@@ -34,7 +34,7 @@ func TestCreateAlexaDevice(t *testing.T) {
 	}
 	raw, _ := json.Marshal(payload)
 	// 1. Send add_device command to control entity
-	_, err := p.OnCommand(types.Command{
+	_, err := p.runCommand(types.Command{
 		ID:      "cmd-1",
 		Payload: json.RawMessage(raw),
 	}, types.Entity{ID: "control"})
@@ -88,7 +88,7 @@ func TestAlexaCommunication(t *testing.T) {
 	})
 
 	p := &PluginAdapter{
-		config: runner.Config{EventSink: sink},
+		pluginCtx: runner.PluginContext{Events: alexaLegacyEventService{sink: sink}},
 	}
 	p.storage = types.Storage{Data: storageData}
 
@@ -128,7 +128,7 @@ func TestAlexaCommunication(t *testing.T) {
 
 func TestOnDeviceDiscover_DoesNotDuplicateControlDevice(t *testing.T) {
 	p := &PluginAdapter{}
-	_, _ = p.OnInitialize(runner.Config{}, types.Storage{})
+	_, _ = p.OnInitialize(testConfig{}, types.Storage{})
 
 	// Simulate persisted state where control already exists.
 	current := []types.Device{
@@ -157,7 +157,7 @@ func TestOnDeviceDiscover_DoesNotDuplicateControlDevice(t *testing.T) {
 
 func TestAlexaErrorStatusMapping(t *testing.T) {
 	p := &PluginAdapter{}
-	_, _ = p.OnInitialize(runner.Config{}, types.Storage{})
+	_, _ = p.OnInitialize(testConfig{}, types.Storage{})
 
 	tests := []struct {
 		name           string
@@ -197,7 +197,7 @@ func TestAlexaErrorStatusMapping(t *testing.T) {
 				raw, _ = json.Marshal(tt.payload)
 			}
 
-			entity, err := p.OnCommand(types.Command{
+			entity, err := p.runCommand(types.Command{
 				ID:      "cmd-test",
 				Payload: json.RawMessage(raw),
 			}, types.Entity{ID: "control"})

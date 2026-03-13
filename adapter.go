@@ -18,9 +18,9 @@ import (
 
 // PluginAdapter implements the runner.Plugin interface using the alexa core package.
 type PluginAdapter struct {
-	config  runner.Config
-	storage types.Storage
-	mu      sync.RWMutex
+	pluginCtx runner.PluginContext
+	storage   types.Storage
+	mu        sync.RWMutex
 
 	relay   *alexa.RelayClient
 	factory *alexa.EventFactory
@@ -30,7 +30,6 @@ type PluginAdapter struct {
 
 	// relayConnected tracks if the relay is currently connected
 	relayConnected bool
-	registryCache  runner.RegistryCache
 }
 
 // AlexaPluginConfig holds the plugin configuration
@@ -42,28 +41,31 @@ type AlexaPluginConfig struct {
 }
 
 // OnInitialize initializes the plugin.
-func (p *PluginAdapter) OnInitialize(config runner.Config, state types.Storage) (types.Manifest, types.Storage) {
-	p.config = config
-	p.storage = state
+func (p *PluginAdapter) Initialize(ctx runner.PluginContext) (types.Manifest, error) {
+	p.pluginCtx = ctx
+	if ctx.Registry != nil {
+		if stored, ok := ctx.Registry.LoadState(); ok {
+			p.storage = stored
+		}
+	}
 	p.factory = alexa.NewEventFactory()
-	p.registryCache = config.RegistryCache
 
 	return types.Manifest{
 		ID:      "plugin-alexa",
 		Name:    "Alexa Bridge",
 		Version: "1.1.0",
 		Schemas: types.CoreDomains(),
-	}, state
+	}, nil
 }
 
-// OnReady starts the relay connection when the plugin is ready.
-func (p *PluginAdapter) OnReady() {
+// Start starts the relay connection when the plugin is ready.
+func (p *PluginAdapter) Start(ctx context.Context) error {
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
 	cfg := p.resolveConfig()
 	if cfg.WSEndpoint == "" || cfg.ClientSecret == "" {
 		fmt.Println("[alexa] missing relay configuration, bridge inactive")
-		return
+		return nil
 	}
 
 	p.relay = alexa.NewRelayClient(
@@ -78,19 +80,29 @@ func (p *PluginAdapter) OnReady() {
 		defer p.wg.Done()
 		p.relay.RunLoop(p.ctx)
 	}()
-}
-
-// WaitReady waits for the plugin to be ready.
-func (p *PluginAdapter) WaitReady(ctx context.Context) error {
 	return nil
 }
 
-// OnShutdown shuts down the plugin.
-func (p *PluginAdapter) OnShutdown() {
+// Stop shuts down the plugin.
+func (p *PluginAdapter) Stop() error {
 	if p.cancel != nil {
 		p.cancel()
 		p.wg.Wait()
 	}
+	return nil
+}
+
+func (p *PluginAdapter) OnReset() error {
+	if p.pluginCtx.Registry == nil {
+		return nil
+	}
+	for _, dev := range p.pluginCtx.Registry.LoadDevices() {
+		_ = p.pluginCtx.Registry.DeleteDevice(dev.ID)
+	}
+	p.mu.Lock()
+	p.storage = types.Storage{}
+	p.mu.Unlock()
+	return p.pluginCtx.Registry.DeleteState()
 }
 
 func (p *PluginAdapter) resolveConfig() AlexaPluginConfig {
@@ -250,14 +262,14 @@ func (p *PluginAdapter) forwardDirectiveToTarget(proxy alexa.AlexaDeviceProxy, n
 
 	// We use the SDK's EventSink to emit an event representing the directive.
 	// This event can be observed by other plugins or used to trigger automations.
-	if p.config.EventSink == nil {
+	if p.pluginCtx.Events == nil {
 		return alexa.ErrRelayDisconnected
 	}
 	if _, ok := cmdPayload["type"].(string); !ok {
 		return fmt.Errorf("%w: unsupported directive %s/%s", alexa.ErrInvalidCommand, namespace, name)
 	}
 	rawPayload, _ := json.Marshal(cmdPayload)
-	err := p.config.EventSink.EmitEvent(types.InboundEvent{
+	err := p.pluginCtx.Events.PublishEvent(types.InboundEvent{
 		DeviceID: proxy.TargetDeviceID,
 		EntityID: proxy.TargetEntityID,
 		Payload:  json.RawMessage(rawPayload),
@@ -272,18 +284,6 @@ func (p *PluginAdapter) forwardDirectiveToTarget(proxy alexa.AlexaDeviceProxy, n
 // OnHealthCheck returns the health status of the plugin.
 func (p *PluginAdapter) OnHealthCheck() (string, error) {
 	return "perfect", nil
-}
-
-// OnConfigUpdate handles storage updates.
-func (p *PluginAdapter) OnConfigUpdate(current types.Storage) (types.Storage, error) {
-	// RawStore pattern: ensure storage.Data contains the Alexa proxy metadata
-	// The plugin state is already in p.storage.Data from handleAddDevice
-	// We need to merge it into the current storage being persisted
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	current.Data = p.storage.Data
-	return current, nil
 }
 
 // OnDeviceCreate handles device creation.
@@ -303,7 +303,7 @@ func (p *PluginAdapter) OnDeviceDiscover(current []types.Device) ([]types.Device
 	}
 
 	// Always include/refresh the control device
-	byID["control"] = runner.ReconcileDevice(byID["control"], types.Device{
+	byID["control"] = reconcileDevice(byID["control"], types.Device{
 		ID:         "control",
 		SourceID:   "alexa-control",
 		SourceName: "Alexa Control",
@@ -321,7 +321,7 @@ func (p *PluginAdapter) OnDeviceDiscover(current []types.Device) ([]types.Device
 	}
 
 	for id := range alexaDevices {
-		byID[id] = runner.ReconcileDevice(byID[id], types.Device{
+		byID[id] = reconcileDevice(byID[id], types.Device{
 			ID:         id,
 			SourceID:   id,
 			SourceName: "Alexa Proxy Device",
@@ -332,7 +332,7 @@ func (p *PluginAdapter) OnDeviceDiscover(current []types.Device) ([]types.Device
 	for _, d := range byID {
 		out = append(out, d)
 	}
-	return runner.EnsureCoreDevice("plugin-alexa", out), nil
+	return ensureCoreDevice("plugin-alexa", out), nil
 }
 
 // OnDeviceSearch handles device search.
@@ -400,17 +400,14 @@ func (p *PluginAdapter) OnEntityDiscover(d string, c []types.Entity) ([]types.En
 		}
 	}
 
-	return runner.EnsureCoreEntities("plugin-alexa", d, c), nil
+	return ensureCoreEntities("plugin-alexa", d, c), nil
 }
 
 func (p *PluginAdapter) buildAutoMirrorsForControl() []types.Entity {
-	if p.registryCache == nil {
+	if p.pluginCtx.Registry == nil {
 		return nil
 	}
-	matches, err := p.registryCache.FindEntities(types.SearchQuery{Pattern: "*"})
-	if err != nil {
-		return nil
-	}
+	matches := p.pluginCtx.Registry.FindEntities(types.SearchQuery{Pattern: "*"})
 
 	out := make([]types.Entity, 0)
 	sort.Slice(matches, func(i, j int) bool {
@@ -472,7 +469,7 @@ func copyLabels(in map[string][]string) map[string][]string {
 }
 
 // OnCommand handles commands for entities.
-func (p *PluginAdapter) OnCommand(req types.Command, entity types.Entity) (types.Entity, error) {
+func (p *PluginAdapter) runCommand(req types.Command, entity types.Entity) (types.Entity, error) {
 	if entity.ID != "control" {
 		return entity, nil
 	}
@@ -498,6 +495,14 @@ func (p *PluginAdapter) OnCommand(req types.Command, entity types.Entity) (types
 	// Command processed successfully, set sync_status to synced
 	entity = setSyncStatus(entity, alexa.SyncStatusSynced)
 	return entity, nil
+}
+
+func (p *PluginAdapter) OnCommand(req types.Command, entity types.Entity) error {
+	updated, err := p.runCommand(req, entity)
+	if p.pluginCtx.Registry != nil && updated.ID != "" && updated.DeviceID != "" {
+		_ = p.pluginCtx.Registry.SaveEntity(updated)
+	}
+	return err
 }
 
 func (p *PluginAdapter) handleAddDevice(payload map[string]any) error {
@@ -529,6 +534,9 @@ func (p *PluginAdapter) handleAddDevice(payload map[string]any) error {
 
 	newData, _ := json.Marshal(data)
 	p.storage.Data = newData
+	if p.pluginCtx.Registry != nil {
+		_ = p.pluginCtx.Registry.SaveState(p.storage)
+	}
 
 	return nil
 }
@@ -611,4 +619,62 @@ func asString(v any) string {
 func setSyncStatus(entity types.Entity, status types.SyncStatus) types.Entity {
 	entity.Data.SyncStatus = status
 	return entity
+}
+
+func reconcileDevice(existing types.Device, discovered types.Device) types.Device {
+	if discovered.SourceID == "" {
+		discovered.SourceID = discovered.ID
+	}
+	if existing.ID == "" {
+		discovered.LocalName = ""
+		if discovered.Labels == nil {
+			discovered.Labels = make(map[string][]string)
+		}
+		return discovered
+	}
+	result := existing
+	result.SourceID = discovered.SourceID
+	result.SourceName = discovered.SourceName
+	if result.Labels == nil {
+		result.Labels = make(map[string][]string)
+	}
+	for k, v := range discovered.Labels {
+		if _, ok := result.Labels[k]; !ok {
+			result.Labels[k] = v
+		}
+	}
+	return result
+}
+
+func ensureCoreDevice(pluginID string, current []types.Device) []types.Device {
+	coreID := types.CoreDeviceID(pluginID)
+	for _, d := range current {
+		if d.ID == coreID {
+			return current
+		}
+	}
+	return append(current, reconcileDevice(types.Device{}, types.Device{
+		ID:         coreID,
+		SourceID:   coreID,
+		SourceName: pluginID,
+	}))
+}
+
+func ensureCoreEntities(pluginID, deviceID string, current []types.Entity) []types.Entity {
+	if deviceID != types.CoreDeviceID(pluginID) {
+		return current
+	}
+	for _, need := range types.CoreEntities(pluginID) {
+		found := false
+		for _, e := range current {
+			if e.ID == need.ID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			current = append(current, need)
+		}
+	}
+	return current
 }

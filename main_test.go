@@ -25,7 +25,7 @@ func TestAlexaDirectiveForwarding(t *testing.T) {
 	})
 
 	p := &PluginAdapter{
-		config: runner.Config{EventSink: sink},
+		pluginCtx: runner.PluginContext{Events: alexaLegacyEventService{sink: sink}},
 	}
 	p.storage = types.Storage{Data: storageData}
 	p.factory = alexa.NewEventFactory()
