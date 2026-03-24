@@ -4,12 +4,14 @@ go 1.26.1
 
 require (
 	github.com/cucumber/godog v0.15.1
-	github.com/slidebolt/sb-contract v1.0.0
-	github.com/slidebolt/sb-domain v1.0.0
-	github.com/slidebolt/sb-testkit v1.0.0
-	github.com/slidebolt/sb-messenger-sdk v1.0.0
-	github.com/slidebolt/sb-runtime v1.0.0
-	github.com/slidebolt/sb-storage-sdk v1.0.0
+	github.com/gorilla/websocket v1.5.3
+	github.com/grandcat/zeroconf v1.0.0
+	github.com/slidebolt/sb-contract v1.0.2
+	github.com/slidebolt/sb-domain v1.0.2
+	github.com/slidebolt/sb-messenger-sdk v1.0.2
+	github.com/slidebolt/sb-runtime v1.0.2
+	github.com/slidebolt/sb-storage-sdk v1.0.2
+	github.com/slidebolt/sb-testkit v1.0.2
 )
 
 require (
@@ -34,6 +36,7 @@ require (
 	github.com/blevesearch/zapx/v14 v14.4.2 // indirect
 	github.com/blevesearch/zapx/v15 v15.4.2 // indirect
 	github.com/blevesearch/zapx/v16 v16.2.8 // indirect
+	github.com/cenkalti/backoff v2.2.1+incompatible // indirect
 	github.com/cucumber/gherkin/go/v26 v26.2.0 // indirect
 	github.com/cucumber/messages/go/v21 v21.0.1 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
@@ -45,6 +48,7 @@ require (
 	github.com/hashicorp/golang-lru v0.5.4 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.18.4 // indirect
+	github.com/miekg/dns v1.1.27 // indirect
 	github.com/minio/highwayhash v1.0.4-0.20251030100505-070ab1a87a76 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
@@ -54,10 +58,13 @@ require (
 	github.com/nats-io/nats.go v1.49.0 // indirect
 	github.com/nats-io/nkeys v0.4.15 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
-	github.com/slidebolt/sb-storage-server v1.0.0 // indirect
+	github.com/slidebolt/sb-script v1.0.2 // indirect
+	github.com/slidebolt/sb-storage-server v1.0.2 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
+	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.etcd.io/bbolt v1.4.0 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
+	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
