@@ -18,6 +18,7 @@ package app
 
 import (
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +27,80 @@ import (
 	messenger "github.com/slidebolt/sb-messenger-sdk"
 	storage "github.com/slidebolt/sb-storage-sdk"
 )
+
+// reportCall records which method was called and with which entity.
+type reportCall struct {
+	method string // "change" or "upsert"
+	entity domain.Entity
+}
+
+// mockReporter records BroadcastChangeReport and UpsertDevice calls for testing.
+type mockReporter struct {
+	mu    sync.Mutex
+	seen  []domain.Entity
+	calls []reportCall
+}
+
+func (r *mockReporter) BroadcastChangeReport(e domain.Entity) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen = append(r.seen, e)
+	r.calls = append(r.calls, reportCall{method: "change", entity: e})
+}
+
+func (r *mockReporter) UpsertDevice(e domain.Entity) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen = append(r.seen, e)
+	r.calls = append(r.calls, reportCall{method: "upsert", entity: e})
+}
+
+func (r *mockReporter) wait(t *testing.T, count int) []domain.Entity {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		n := len(r.seen)
+		r.mu.Unlock()
+		if n >= count {
+			r.mu.Lock()
+			out := append([]domain.Entity(nil), r.seen...)
+			r.mu.Unlock()
+			return out
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out: want %d reports, got %d", count, len(r.seen))
+	return nil
+}
+
+func (r *mockReporter) waitCalls(t *testing.T, count int) []reportCall {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		n := len(r.calls)
+		r.mu.Unlock()
+		if n >= count {
+			r.mu.Lock()
+			out := append([]reportCall(nil), r.calls...)
+			r.mu.Unlock()
+			return out
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	r.mu.Lock()
+	n := len(r.calls)
+	r.mu.Unlock()
+	t.Fatalf("timed out: want %d calls, got %d", count, n)
+	return nil
+}
+
+func (r *mockReporter) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.seen)
+}
 
 // ==========================================================================
 // Custom entity type — defined by this plugin, NOT in sb-domain.
@@ -526,5 +601,229 @@ func TestMixed_FullLifecycle_SaveQueryCommandHydrate(t *testing.T) {
 	}
 	if setBr.Brightness != 254 {
 		t.Errorf("brightness: %v", setBr.Brightness)
+	}
+}
+
+// ==========================================================================
+// Alexa change-report watching
+//
+// The plugin must broadcast a change report for any entity labeled PluginAlexa
+// when its state changes. Critically, it must also broadcast for entities that
+// ALREADY HAVE the label when the plugin starts — not just future changes.
+// ==========================================================================
+
+func alexaLabeledEntity(plugin, device, id, name string, state any) domain.Entity {
+	return domain.Entity{
+		ID: id, Plugin: plugin, DeviceID: device,
+		Type:  "light",
+		Name:  name,
+		State: state,
+	}
+}
+
+// saveAlexaEntity saves an entity and sets the PluginAlexa label via SetProfile.
+// Labels must go through SetProfile (sidecar) — store.Save strips them.
+func saveAlexaEntity(t *testing.T, store storage.Storage, plugin, device, id, name string, state any) domain.Entity {
+	t.Helper()
+	ent := alexaLabeledEntity(plugin, device, id, name, state)
+	if err := store.Save(ent); err != nil {
+		t.Fatal(err)
+	}
+	key := domain.EntityKey{Plugin: plugin, DeviceID: device, ID: id}
+	profile := json.RawMessage(`{"labels":{"PluginAlexa":["default"]}}`)
+	if err := store.SetProfile(key, profile); err != nil {
+		t.Fatal(err)
+	}
+	// Re-save so state.changed fires with the merged label data.
+	if err := store.Save(ent); err != nil {
+		t.Fatal(err)
+	}
+	return ent
+}
+
+// TestAlexaWatch_FiresForPreExistingLabeledEntity verifies that an entity with
+// the PluginAlexa label that already exists in storage before the watch starts
+// receives a change report immediately — without waiting for a state change.
+//
+// This fails with the current implementation because the raw state.changed.>
+// subscription only sees future events; it never scans existing storage.
+func TestAlexaWatch_FiresForPreExistingLabeledEntity(t *testing.T) {
+	e := testkit.NewTestEnv(t)
+	e.Start("messenger")
+	e.Start("storage")
+	msg := e.Messenger()
+	store := e.Storage()
+
+	// Entity is in storage BEFORE the watch starts.
+	saveAlexaEntity(t, store, "test", "dev1", "light1", "Kitchen", domain.Light{Power: true})
+
+	reporter := &mockReporter{}
+	if err := startAlexaWatch(msg, store, reporter); err != nil {
+		t.Fatal(err)
+	}
+
+	// Expect a change report without any state.changed event being published.
+	got := reporter.wait(t, 1)
+	if got[0].ID != "light1" {
+		t.Errorf("reported entity: got %q, want light1", got[0].ID)
+	}
+}
+
+// TestAlexaWatch_IgnoresUnlabeledEntities verifies that state changes for
+// entities without the PluginAlexa label do NOT produce change reports.
+func TestAlexaWatch_IgnoresUnlabeledEntities(t *testing.T) {
+	e := testkit.NewTestEnv(t)
+	e.Start("messenger")
+	e.Start("storage")
+	msg := e.Messenger()
+	store := e.Storage()
+
+	reporter := &mockReporter{}
+	if err := startAlexaWatch(msg, store, reporter); err != nil {
+		t.Fatal(err)
+	}
+
+	// Save an entity WITHOUT the PluginAlexa label — should not trigger a report.
+	unlabeled := domain.Entity{
+		ID: "switch1", Plugin: "test", DeviceID: "dev1",
+		Type: "switch", Name: "Switch",
+		State: domain.Switch{Power: true},
+	}
+	if err := store.Save(unlabeled); err != nil {
+		t.Fatal(err)
+	}
+
+	// Give any spurious reports a moment to arrive.
+	time.Sleep(100 * time.Millisecond)
+	if n := reporter.count(); n != 0 {
+		t.Errorf("unlabeled entity: got %d reports, want 0", n)
+	}
+}
+
+// TestAlexaWatch_FiresOnLabeledEntityStateChange verifies that a state change
+// to a PluginAlexa-labeled entity after the watch is started produces a report.
+func TestAlexaWatch_FiresOnLabeledEntityStateChange(t *testing.T) {
+	e := testkit.NewTestEnv(t)
+	e.Start("messenger")
+	e.Start("storage")
+	msg := e.Messenger()
+	store := e.Storage()
+
+	// Set up PluginAlexa label via SetProfile before watch starts.
+	key := domain.EntityKey{Plugin: "test", DeviceID: "dev1", ID: "light2"}
+	profile := json.RawMessage(`{"labels":{"PluginAlexa":["default"]}}`)
+	if err := store.SetProfile(key, profile); err != nil {
+		t.Fatal(err)
+	}
+
+	reporter := &mockReporter{}
+	if err := startAlexaWatch(msg, store, reporter); err != nil {
+		t.Fatal(err)
+	}
+
+	// State change AFTER watch starts — entity already has PluginAlexa label.
+	ent := alexaLabeledEntity("test", "dev1", "light2", "Living Room", domain.Light{Power: true, Brightness: 200})
+	if err := store.Save(ent); err != nil {
+		t.Fatal(err)
+	}
+
+	got := reporter.wait(t, 1)
+	if got[0].ID != "light2" {
+		t.Errorf("reported entity: got %q, want light2", got[0].ID)
+	}
+}
+
+// ==========================================================================
+// Alexa capability-change detection
+//
+// When an entity's Alexa capabilities change (e.g. gains color temperature),
+// the watch must call UpsertDevice — not just BroadcastChangeReport — so the
+// updated endpoint definition reaches DynamoDB and triggers an
+// AddOrUpdateReport to Alexa.
+// ==========================================================================
+
+// TestAlexaWatch_UpsertsOnCapabilityChange verifies that when an entity's
+// capabilities change (e.g. a light gains ColorTemperatureController), the
+// watch calls UpsertDevice instead of BroadcastChangeReport.
+func TestAlexaWatch_UpsertsOnCapabilityChange(t *testing.T) {
+	e := testkit.NewTestEnv(t)
+	e.Start("messenger")
+	e.Start("storage")
+	msg := e.Messenger()
+	store := e.Storage()
+
+	// Save a brightness-only light with the PluginAlexa label.
+	saveAlexaEntity(t, store, "test", "dev1", "light3", "Movie Room",
+		domain.Light{Power: true, Brightness: 200})
+
+	reporter := &mockReporter{}
+	if err := startAlexaWatch(msg, store, reporter); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for the initial UpsertDevice from the pre-existing entity scan.
+	reporter.waitCalls(t, 1)
+
+	// Now update the entity: add color temperature mode. This changes
+	// the Alexa capabilities (adds ColorTemperatureController).
+	ent := domain.Entity{
+		ID: "light3", Plugin: "test", DeviceID: "dev1",
+		Type: "light", Name: "Movie Room",
+		State: domain.Light{Power: true, Brightness: 200, ColorMode: "color_temp", Temperature: 300},
+	}
+	if err := store.Save(ent); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for the second call triggered by the state change.
+	calls := reporter.waitCalls(t, 2)
+
+	// The second call must be an upsert (capability change), not a change report.
+	second := calls[1]
+	if second.method != "upsert" {
+		t.Errorf("capability change: got method %q, want \"upsert\"", second.method)
+	}
+	if second.entity.ID != "light3" {
+		t.Errorf("entity ID: got %q, want light3", second.entity.ID)
+	}
+}
+
+// TestAlexaWatch_StateOnlyChangeStillBroadcasts verifies that when only the
+// state changes (no capability change), the watch calls BroadcastChangeReport.
+func TestAlexaWatch_StateOnlyChangeStillBroadcasts(t *testing.T) {
+	e := testkit.NewTestEnv(t)
+	e.Start("messenger")
+	e.Start("storage")
+	msg := e.Messenger()
+	store := e.Storage()
+
+	// Save a light with the PluginAlexa label.
+	saveAlexaEntity(t, store, "test", "dev1", "light4", "Hallway",
+		domain.Light{Power: true, Brightness: 100})
+
+	reporter := &mockReporter{}
+	if err := startAlexaWatch(msg, store, reporter); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for initial upsert from pre-existing entity scan.
+	reporter.waitCalls(t, 1)
+
+	// Update brightness only — no capability change.
+	ent := domain.Entity{
+		ID: "light4", Plugin: "test", DeviceID: "dev1",
+		Type: "light", Name: "Hallway",
+		State: domain.Light{Power: true, Brightness: 200},
+	}
+	if err := store.Save(ent); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := reporter.waitCalls(t, 2)
+
+	// The second call should be a change report, not an upsert.
+	second := calls[1]
+	if second.method != "change" {
+		t.Errorf("state-only change: got method %q, want \"change\"", second.method)
 	}
 }
