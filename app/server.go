@@ -1,248 +1,361 @@
 package app
 
 import (
-	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
-	"net/http"
-	"strings"
+	"net/url"
 	"sync"
-	"syscall"
+	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/grandcat/zeroconf"
 	domain "github.com/slidebolt/sb-domain"
 	messenger "github.com/slidebolt/sb-messenger-sdk"
 	translate "github.com/slidebolt/plugin-alexa/internal/translate"
 	storage "github.com/slidebolt/sb-storage-sdk"
 )
 
-// --- Wire types (Alexa relay protocol) ---
+const (
+	keepaliveInterval = 4 * time.Minute
+	reconnectDelay    = 5 * time.Second
+	writeTimeout      = 10 * time.Second
+	readTimeout       = 10 * time.Minute // generous; keepalive resets it
+)
 
-// wireMessage is the envelope for all messages between plugin and relay.
-type wireMessage struct {
-	Type string `json:"type"`
+// --- Wire types (AWS relay protocol) ---
 
-	// hello handshake
-	Auth *bool `json:"auth,omitempty"`
-
-	// discovery response
-	Endpoints []translate.AlexaEndpoint `json:"endpoints,omitempty"`
-
-	// directive (relay → plugin)
-	Directive *wireDirective `json:"directive,omitempty"`
-
-	// directive_result (plugin → relay)
-	ID      string `json:"id,omitempty"`
-	Success *bool  `json:"success,omitempty"`
-
-	// change_report (plugin → relay)
-	Event *wireAlexaEvent `json:"event,omitempty"`
+// relayRequest is the envelope for messages sent TO the AWS relay.
+type relayRequest struct {
+	Action   string              `json:"action"`
+	ClientID string              `json:"clientId,omitempty"`
+	Secret   string              `json:"secret,omitempty"`
+	Endpoint *translate.AlexaEndpoint `json:"endpoint,omitempty"`
+	State    map[string]any      `json:"state,omitempty"`
+	DeviceID string              `json:"deviceId,omitempty"`
 }
 
-// wireDirective represents an Alexa directive arriving from the relay.
-type wireDirective struct {
-	Header   wireHeader     `json:"header"`
-	Endpoint wireEndpoint   `json:"endpoint"`
-	Payload  map[string]any `json:"payload"`
+// relayResponse is the envelope for messages received FROM the AWS relay.
+type relayResponse struct {
+	OK           *bool          `json:"ok,omitempty"`
+	Error        string         `json:"error,omitempty"`
+	ConnectionID string         `json:"connectionId,omitempty"`
+	DeviceID     string         `json:"deviceId,omitempty"`
+	Devices      []any          `json:"devices,omitempty"`
+	Type         string         `json:"type,omitempty"`         // "alexaDirective" for pushed directives
+	Directive    *awsDirective  `json:"directive,omitempty"`
 }
 
-type wireHeader struct {
-	Namespace  string `json:"namespace"`
-	Name       string `json:"name"`
-	MessageID  string `json:"messageId"`
-	Instance   string `json:"instance,omitempty"`
+// awsDirective is an Alexa directive pushed by the SmartHome Lambda.
+type awsDirective struct {
+	Header   awsDirectiveHeader `json:"header"`
+	Endpoint awsEndpoint        `json:"endpoint"`
+	Payload  map[string]any     `json:"payload"`
 }
 
-type wireEndpoint struct {
+type awsDirectiveHeader struct {
+	Namespace        string `json:"namespace"`
+	Name             string `json:"name"`
+	MessageID        string `json:"messageId"`
+	Instance         string `json:"instance,omitempty"`
+	CorrelationToken string `json:"correlationToken,omitempty"`
+}
+
+type awsEndpoint struct {
 	EndpointID string `json:"endpointId"`
 }
 
-// wireAlexaEvent wraps a fully-formed Alexa event (ChangeReport, StateReport).
-type wireAlexaEvent struct {
-	Header     wireHeader            `json:"header"`
-	Endpoint   wireEndpoint          `json:"endpoint"`
-	Payload    map[string]any        `json:"payload"`
-}
+// --- alexaClient ---
 
-// --- alexaServer ---
-
-type alexaServer struct {
+type alexaClient struct {
 	cfg   Config
 	store storage.Storage
 	cmds  *messenger.Commands
 
-	mu      sync.RWMutex
-	clients []*websocket.Conn
+	mu   sync.Mutex
+	conn *websocket.Conn
 
-	srv  *http.Server
-	ln   net.Listener
-	mdns *zeroconf.Server
+	stopCh chan struct{}
+	doneCh chan struct{}
 
-	// onDiscoverySent is called after first successful handshake (test hook).
-	onDiscoverySent func()
-
-	// testEntities is an optional in-memory entity map for tests.
-	testEntities map[string]domain.Entity
+	// testMode disables reconnect loop for testing.
+	testMode bool
 }
 
-func newServer(cfg Config, store storage.Storage, cmds *messenger.Commands) *alexaServer {
-	return &alexaServer{
-		cfg:   cfg,
-		store: store,
-		cmds:  cmds,
-	}
-}
-
-// Start begins listening for WebSocket connections and registers mDNS.
-func (s *alexaServer) Start() (int, error) {
-	lc := net.ListenConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			return c.Control(func(fd uintptr) {
-				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1) //nolint:errcheck
-			})
-		},
-	}
-	ln, err := lc.Listen(context.Background(), "tcp", ":"+s.cfg.Port)
-	if err != nil {
-		return 0, fmt.Errorf("listen: %w", err)
-	}
-	s.ln = ln
-	port := ln.Addr().(*net.TCPAddr).Port
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", s.handleWS)
-	s.srv = &http.Server{Handler: mux}
-
-	go func() {
-		if err := s.srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			log.Printf("plugin-alexa: server error: %v", err)
-		}
-	}()
-
-	iface := outboundInterface()
-	instanceID := stableInstanceID(iface)
-	mdns, err := zeroconf.Register(
-		"SlideBolt-Alexa",
-		"_alexa-slidebolt._tcp",
-		"local.",
-		port,
-		[]string{"version=1.0.0", "id=" + instanceID},
-		iface,
-	)
-	if err != nil {
-		log.Printf("plugin-alexa: mDNS registration failed: %v", err)
-	} else {
-		s.mdns = mdns
-		log.Printf("plugin-alexa: mDNS advertising _alexa-slidebolt._tcp on port %d", port)
-	}
-
-	return port, nil
-}
-
-// Stop shuts down the HTTP server and unregisters mDNS.
-func (s *alexaServer) Stop() {
-	s.mu.Lock()
-	for _, c := range s.clients {
-		c.Close()
-	}
-	s.clients = nil
-	s.mu.Unlock()
-
-	if s.mdns != nil {
-		s.mdns.Shutdown()
-	}
-	if s.srv != nil {
-		s.srv.Shutdown(context.Background()) //nolint:errcheck
+func newClient(cfg Config, store storage.Storage, cmds *messenger.Commands) *alexaClient {
+	return &alexaClient{
+		cfg:    cfg,
+		store:  store,
+		cmds:   cmds,
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
 	}
 }
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+// Start begins the connection loop in a background goroutine.
+func (c *alexaClient) Start() error {
+	if c.cfg.WSURL == "" || c.cfg.ClientID == "" || c.cfg.ClientSecret == "" || c.cfg.RelayToken == "" {
+		return fmt.Errorf("missing ALEXA_WS_URL, ALEXA_CLIENT_ID, ALEXA_CLIENT_SECRET, or ALEXA_RELAY_TOKEN")
+	}
+	go c.connectLoop()
+	return nil
 }
 
-func (s *alexaServer) handleWS(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("plugin-alexa: upgrade error: %v", err)
-		return
+// Stop gracefully shuts down the client.
+func (c *alexaClient) Stop() {
+	close(c.stopCh)
+	c.mu.Lock()
+	if c.conn != nil {
+		c.conn.Close()
 	}
-	defer func() {
-		s.removeClient(conn)
-		conn.Close()
-	}()
+	c.mu.Unlock()
+	<-c.doneCh
+}
 
-	log.Printf("plugin-alexa: relay connected from %s", r.RemoteAddr)
-
-	// 1. Read hello from relay
-	var hello wireMessage
-	if err := conn.ReadJSON(&hello); err != nil {
-		log.Printf("plugin-alexa: read hello: %v", err)
-		return
-	}
-	if hello.Type != "hello" {
-		log.Printf("plugin-alexa: expected hello, got %q", hello.Type)
+// BroadcastChangeReport translates an entity state change into an AWS
+// state_update and sends it over the active connection.
+func (c *alexaClient) BroadcastChangeReport(entity domain.Entity) {
+	props := translate.AlexaState(entity)
+	if len(props) == 0 {
 		return
 	}
 
-	// 2. Respond with hello + auth
-	authOK := true
-	if err := conn.WriteJSON(wireMessage{Type: "hello", Auth: &authOK}); err != nil {
-		log.Printf("plugin-alexa: write hello: %v", err)
-		return
-	}
+	state := alexaStatePayload(props)
+	log.Printf("plugin-alexa: state_update %s (%d properties)", entity.Key(), len(props))
+	c.send(relayRequest{
+		Action:   "state_update",
+		ClientID: c.cfg.ClientID,
+		DeviceID: entity.Key(),
+		State:    state,
+	})
+}
 
-	// 3. Send discovery response with all Alexa endpoints
-	endpoints, err := s.buildDiscovery()
-	if err != nil {
-		log.Printf("plugin-alexa: build discovery: %v", err)
-		return
-	}
-	if err := conn.WriteJSON(wireMessage{Type: "discovery", Endpoints: endpoints}); err != nil {
-		log.Printf("plugin-alexa: write discovery: %v", err)
-		return
-	}
-	log.Printf("plugin-alexa: discovery sent (%d endpoints)", len(endpoints))
+// UpsertDevice pushes a device_upsert for an entity.
+func (c *alexaClient) UpsertDevice(entity domain.Entity) {
+	ep := translate.ToAlexa(entity)
+	props := translate.AlexaState(entity)
+	state := alexaStatePayload(props)
 
-	if s.onDiscoverySent != nil {
-		s.onDiscoverySent()
-	}
+	log.Printf("plugin-alexa: device_upsert %s (%s)", entity.Key(), entity.Name)
+	c.send(relayRequest{
+		Action:   "device_upsert",
+		ClientID: c.cfg.ClientID,
+		Endpoint: &ep,
+		State:    state,
+	})
+}
 
-	// 4. Register client and enter directive loop
-	s.addClient(conn)
+// DeleteDevice pushes a device_delete for an entity.
+func (c *alexaClient) DeleteDevice(entity domain.Entity) {
+	c.send(relayRequest{
+		Action:   "device_delete",
+		ClientID: c.cfg.ClientID,
+		DeviceID: entity.Key(),
+	})
+}
+
+// --- connection lifecycle ---
+
+func (c *alexaClient) connectLoop() {
+	defer close(c.doneCh)
+
 	for {
-		var msg wireMessage
-		if err := conn.ReadJSON(&msg); err != nil {
-			log.Printf("plugin-alexa: relay disconnected: %v", err)
+		select {
+		case <-c.stopCh:
+			return
+		default:
+		}
+
+		if err := c.connectAndRun(); err != nil {
+			log.Printf("plugin-alexa: connection error: %v", err)
+		}
+
+		if c.testMode {
 			return
 		}
 
-		if msg.Type == "directive" && msg.Directive != nil {
-			s.handleDirective(conn, msg)
-		} else {
-			log.Printf("plugin-alexa: unknown message type %q", msg.Type)
+		select {
+		case <-c.stopCh:
+			return
+		case <-time.After(reconnectDelay):
+			log.Printf("plugin-alexa: reconnecting...")
 		}
 	}
 }
 
-// handleDirective processes an Alexa directive from the relay, translates it
-// to a domain command, and routes it to the owning plugin.
-func (s *alexaServer) handleDirective(conn *websocket.Conn, msg wireMessage) {
-	d := msg.Directive
-	endpointID := d.Endpoint.EndpointID
+func (c *alexaClient) connectAndRun() error {
+	// 1. Dial the AWS WebSocket with the relay token.
+	u, err := url.Parse(c.cfg.WSURL)
+	if err != nil {
+		return fmt.Errorf("parse ws url: %w", err)
+	}
+	q := u.Query()
+	q.Set("connectToken", c.cfg.RelayToken)
+	u.RawQuery = q.Encode()
 
-	entity, err := s.findEntityByEndpointID(endpointID)
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	c.mu.Lock()
+	c.conn = conn
+	c.mu.Unlock()
+
+	defer func() {
+		conn.Close()
+		c.mu.Lock()
+		if c.conn == conn {
+			c.conn = nil
+		}
+		c.mu.Unlock()
+	}()
+
+	log.Printf("plugin-alexa: connected to %s", c.cfg.WSURL)
+
+	// 2. Register with clientId + secret.
+	if err := c.register(conn); err != nil {
+		return fmt.Errorf("register: %w", err)
+	}
+	log.Printf("plugin-alexa: registered as %s", c.cfg.ClientID)
+
+	// 3. Sync all PluginAlexa-labeled entities as device_upserts.
+	if err := c.syncDevices(conn); err != nil {
+		log.Printf("plugin-alexa: sync devices: %v", err)
+		// Non-fatal — continue with directive loop.
+	}
+
+	// 4. Start keepalive ticker.
+	stopKeepalive := make(chan struct{})
+	go c.keepaliveLoop(conn, stopKeepalive)
+	defer close(stopKeepalive)
+
+	// 5. Read loop — listen for pushed directives from AWS.
+	return c.readLoop(conn)
+}
+
+func (c *alexaClient) register(conn *websocket.Conn) error {
+	msg := relayRequest{
+		Action:   "register",
+		ClientID: c.cfg.ClientID,
+		Secret:   c.cfg.ClientSecret,
+	}
+	conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	if err := conn.WriteJSON(msg); err != nil {
+		return fmt.Errorf("send register: %w", err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(readTimeout))
+	var resp relayResponse
+	if err := conn.ReadJSON(&resp); err != nil {
+		return fmt.Errorf("read register response: %w", err)
+	}
+	if resp.OK == nil || !*resp.OK {
+		return fmt.Errorf("register rejected: %s", resp.Error)
+	}
+	return nil
+}
+
+func (c *alexaClient) syncDevices(conn *websocket.Conn) error {
+	if c.store == nil {
+		return nil
+	}
+	entries, err := c.store.Query(storage.Query{
+		Where: []storage.Filter{{Field: "labels.PluginAlexa", Op: storage.Exists}},
+	})
+	if err != nil {
+		return fmt.Errorf("query entities: %w", err)
+	}
+
+	for _, entry := range entries {
+		var entity domain.Entity
+		if err := json.Unmarshal(entry.Data, &entity); err != nil {
+			continue
+		}
+		ep := translate.ToAlexa(entity)
+		props := translate.AlexaState(entity)
+		state := alexaStatePayload(props)
+
+		msg := relayRequest{
+			Action:   "device_upsert",
+			ClientID: c.cfg.ClientID,
+			Endpoint: &ep,
+			State:    state,
+		}
+		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		if err := conn.WriteJSON(msg); err != nil {
+			return fmt.Errorf("upsert %s: %w", entity.Key(), err)
+		}
+
+		// Read ack (relay responds to every action).
+		conn.SetReadDeadline(time.Now().Add(readTimeout))
+		var resp relayResponse
+		if err := conn.ReadJSON(&resp); err != nil {
+			return fmt.Errorf("read upsert response: %w", err)
+		}
+		if resp.OK != nil && !*resp.OK {
+			log.Printf("plugin-alexa: upsert %s rejected: %s", entity.Key(), resp.Error)
+		}
+	}
+
+	log.Printf("plugin-alexa: synced %d devices to AWS", len(entries))
+	return nil
+}
+
+func (c *alexaClient) keepaliveLoop(conn *websocket.Conn, stop chan struct{}) {
+	ticker := time.NewTicker(keepaliveInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			c.mu.Lock()
+			active := c.conn == conn
+			c.mu.Unlock()
+			if !active {
+				return
+			}
+			c.send(relayRequest{Action: "keepalive"})
+		}
+	}
+}
+
+func (c *alexaClient) readLoop(conn *websocket.Conn) error {
+	for {
+		select {
+		case <-c.stopCh:
+			return nil
+		default:
+		}
+
+		conn.SetReadDeadline(time.Now().Add(readTimeout))
+		var msg relayResponse
+		if err := conn.ReadJSON(&msg); err != nil {
+			return fmt.Errorf("read: %w", err)
+		}
+
+		// The relay pushes alexaDirective messages when Alexa sends a control command.
+		if msg.Type == "alexaDirective" && msg.Directive != nil {
+			c.handleDirective(msg.Directive)
+		}
+		// Other messages (keepalive acks, state_update acks) are logged but not acted on.
+	}
+}
+
+// --- directive handling ---
+
+func (c *alexaClient) handleDirective(d *awsDirective) {
+	endpointID := d.Endpoint.EndpointID
+	log.Printf("plugin-alexa: directive %s.%s for %s", d.Header.Namespace, d.Header.Name, endpointID)
+
+	entity, err := c.findEntityByEndpointID(endpointID)
 	if err != nil {
 		log.Printf("plugin-alexa: entity not found for %q: %v", endpointID, err)
-		fail := false
-		conn.WriteJSON(wireMessage{Type: "directive_result", ID: d.Header.MessageID, Success: &fail}) //nolint:errcheck
 		return
 	}
 
-	// Pass instance from header into payload so FromAlexa can read it.
 	payload := d.Payload
 	if payload == nil {
 		payload = map[string]any{}
@@ -254,45 +367,23 @@ func (s *alexaServer) handleDirective(conn *websocket.Conn, msg wireMessage) {
 	cmd, err := translate.FromAlexa(entity.Type, d.Header.Namespace, d.Header.Name, payload)
 	if err != nil {
 		log.Printf("plugin-alexa: fromAlexa %s/%s: %v", d.Header.Namespace, d.Header.Name, err)
-		fail := false
-		conn.WriteJSON(wireMessage{Type: "directive_result", ID: d.Header.MessageID, Success: &fail}) //nolint:errcheck
 		return
 	}
 
-	if s.testEntities != nil {
-		// Test mode: apply locally and broadcast.
-		updated := applyCommand(entity, cmd)
-		s.testEntities[endpointID] = updated
-		success := true
-		conn.WriteJSON(wireMessage{Type: "directive_result", ID: d.Header.MessageID, Success: &success}) //nolint:errcheck
-		s.BroadcastChangeReport(updated)
-		return
-	}
-
-	// Production: route the command to the entity's owning plugin.
-	if actionCmd, ok := cmd.(messenger.Action); ok && s.cmds != nil {
+	// Route the command to the entity's owning plugin via messenger.
+	if actionCmd, ok := cmd.(messenger.Action); ok && c.cmds != nil {
 		target := domain.EntityKey{Plugin: entity.Plugin, DeviceID: entity.DeviceID, ID: entity.ID}
-		if err := s.cmds.Send(target, actionCmd); err != nil {
+		if err := c.cmds.Send(target, actionCmd); err != nil {
 			log.Printf("plugin-alexa: route command to %s: %v", target.Key(), err)
-			fail := false
-			conn.WriteJSON(wireMessage{Type: "directive_result", ID: d.Header.MessageID, Success: &fail}) //nolint:errcheck
-			return
 		}
 	}
-
-	success := true
-	conn.WriteJSON(wireMessage{Type: "directive_result", ID: d.Header.MessageID, Success: &success}) //nolint:errcheck
 }
 
-// findEntityByEndpointID looks up an entity by its Alexa endpoint ID (entity key).
-func (s *alexaServer) findEntityByEndpointID(endpointID string) (domain.Entity, error) {
-	if s.testEntities != nil {
-		if e, ok := s.testEntities[endpointID]; ok {
-			return e, nil
-		}
-		return domain.Entity{}, fmt.Errorf("entity %q not found", endpointID)
+func (c *alexaClient) findEntityByEndpointID(endpointID string) (domain.Entity, error) {
+	if c.store == nil {
+		return domain.Entity{}, fmt.Errorf("no store")
 	}
-	entries, err := s.store.Query(storage.Query{
+	entries, err := c.store.Query(storage.Query{
 		Where: []storage.Filter{{Field: "labels.PluginAlexa", Op: storage.Exists}},
 	})
 	if err != nil {
@@ -310,201 +401,66 @@ func (s *alexaServer) findEntityByEndpointID(endpointID string) (domain.Entity, 
 	return domain.Entity{}, fmt.Errorf("entity %q not found", endpointID)
 }
 
-// BroadcastChangeReport sends an Alexa ChangeReport to all connected relay clients.
-func (s *alexaServer) BroadcastChangeReport(entity domain.Entity) {
-	props := translate.AlexaState(entity)
-	changeProps := make([]translate.AlexaProperty, 0, len(props))
-	for _, p := range props {
-		if p.Namespace != "Alexa.EndpointHealth" {
-			changeProps = append(changeProps, p)
-		}
-	}
-	if len(changeProps) == 0 {
+// --- send helper (thread-safe) ---
+
+func (c *alexaClient) send(msg relayRequest) {
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+
+	if conn == nil {
 		return
 	}
 
-	event := &wireAlexaEvent{
-		Header: wireHeader{
-			Namespace: "Alexa",
-			Name:      "ChangeReport",
-		},
-		Endpoint: wireEndpoint{
-			EndpointID: entity.Key(),
-		},
-		Payload: map[string]any{
-			"change": map[string]any{
-				"cause":      map[string]string{"type": "PHYSICAL_INTERACTION"},
-				"properties": changeProps,
-			},
-		},
-	}
-
-	msg := wireMessage{Type: "change_report", Event: event}
-	s.Broadcast(msg)
-}
-
-// Broadcast sends a message to all connected relay clients.
-func (s *alexaServer) Broadcast(msg wireMessage) {
-	s.mu.RLock()
-	clients := make([]*websocket.Conn, len(s.clients))
-	copy(clients, s.clients)
-	s.mu.RUnlock()
-
-	for _, conn := range clients {
-		if err := conn.WriteJSON(msg); err != nil {
-			log.Printf("plugin-alexa: broadcast error: %v", err)
-		}
+	conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	if err := conn.WriteJSON(msg); err != nil {
+		log.Printf("plugin-alexa: send %s: %v", msg.Action, err)
 	}
 }
 
-func (s *alexaServer) addClient(conn *websocket.Conn) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.clients = append(s.clients, conn)
-}
+// --- helpers ---
 
-func (s *alexaServer) removeClient(conn *websocket.Conn) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i, c := range s.clients {
-		if c == conn {
-			s.clients = append(s.clients[:i], s.clients[i+1:]...)
-			return
+func alexaStatePayload(props []translate.AlexaProperty) map[string]any {
+	arr := make([]map[string]any, len(props))
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for i, p := range props {
+		arr[i] = map[string]any{
+			"namespace":                 p.Namespace,
+			"name":                      p.Name,
+			"value":                     p.Value,
+			"timeOfSample":              now,
+			"uncertaintyInMilliseconds": 500,
+		}
+		if p.Instance != "" {
+			arr[i]["instance"] = p.Instance
 		}
 	}
-}
-
-// buildDiscovery returns all PluginAlexa-labeled entities as Alexa endpoints.
-func (s *alexaServer) buildDiscovery() ([]translate.AlexaEndpoint, error) {
-	if s.testEntities != nil {
-		endpoints := make([]translate.AlexaEndpoint, 0, len(s.testEntities))
-		for _, entity := range s.testEntities {
-			endpoints = append(endpoints, translate.ToAlexa(entity))
-		}
-		return endpoints, nil
-	}
-	if s.store == nil {
-		return []translate.AlexaEndpoint{}, nil
-	}
-	entries, err := s.store.Query(storage.Query{
-		Where: []storage.Filter{{Field: "labels.PluginAlexa", Op: storage.Exists}},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("query entities: %w", err)
-	}
-	endpoints := make([]translate.AlexaEndpoint, 0, len(entries))
-	for _, entry := range entries {
-		var entity domain.Entity
-		if err := json.Unmarshal(entry.Data, &entity); err != nil {
-			continue
-		}
-		endpoints = append(endpoints, translate.ToAlexa(entity))
-	}
-	return endpoints, nil
-}
-
-// --- Network helpers ---
-
-func stableInstanceID(ifaces []net.Interface) string {
-	for _, iface := range ifaces {
-		if len(iface.HardwareAddr) > 0 {
-			return hex.EncodeToString(iface.HardwareAddr)
-		}
-	}
-	if h, err := net.LookupAddr("127.0.0.1"); err == nil && len(h) > 0 {
-		return h[0]
-	}
-	return "slidebolt-alexa-unknown"
-}
-
-func outboundInterface() []net.Interface {
-	conn, err := net.Dial("udp", "1.1.1.1:53")
-	if err != nil {
-		return nil
-	}
-	defer conn.Close()
-	localIP := conn.LocalAddr().(*net.UDPAddr).IP
-
-	ifaces, _ := net.Interfaces()
-	for _, iface := range ifaces {
-		addrs, _ := iface.Addrs()
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip != nil && ip.Equal(localIP) {
-				return []net.Interface{iface}
-			}
-		}
-	}
-	return nil
-}
-
-// slugify converts a string to a safe ID: lowercase, non-alphanum replaced
-// with underscores, leading/trailing underscores stripped.
-func slugify(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	prev := byte('_')
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
-			b.WriteByte(c)
-			prev = c
-		case c >= 'A' && c <= 'Z':
-			b.WriteByte(c + 32)
-			prev = c
-		default:
-			if prev != '_' {
-				b.WriteByte('_')
-				prev = '_'
-			}
-		}
-	}
-	out := b.String()
-	return strings.Trim(out, "_")
+	return map[string]any{"properties": arr}
 }
 
 // --- Test helpers ---
 
-// ServerRunner is returned by NewServerForTest for testing.
+// ServerRunner is the interface used by tests to start/stop the client.
 type ServerRunner interface {
-	Start() (int, error)
+	Start() error
 	Stop()
 	Connected() <-chan struct{}
 }
 
-type testAlexaServer struct {
-	*alexaServer
+type testAlexaClient struct {
+	*alexaClient
 	connectedCh chan struct{}
-	once        sync.Once
 }
 
-func (t *testAlexaServer) Connected() <-chan struct{} { return t.connectedCh }
+func (t *testAlexaClient) Connected() <-chan struct{} { return t.connectedCh }
 
-func (t *testAlexaServer) Start() (int, error) {
-	t.alexaServer.onDiscoverySent = func() {
-		t.once.Do(func() { close(t.connectedCh) })
-	}
-	return t.alexaServer.Start()
-}
-
-// NewServerForTest creates a standalone alexaServer for testing.
-func NewServerForTest(cfg Config, entities ...domain.Entity) ServerRunner {
-	s := newServer(cfg, nil, nil)
-	if len(entities) > 0 {
-		s.testEntities = make(map[string]domain.Entity, len(entities))
-		for _, e := range entities {
-			s.testEntities[e.Key()] = e
-		}
-	}
-	return &testAlexaServer{
-		alexaServer: s,
+// NewClientForTest creates a standalone alexaClient for testing.
+// It connects to the given wsURL with the provided credentials.
+func NewClientForTest(cfg Config) ServerRunner {
+	cl := newClient(cfg, nil, nil)
+	cl.testMode = true
+	return &testAlexaClient{
+		alexaClient: cl,
 		connectedCh: make(chan struct{}),
 	}
 }

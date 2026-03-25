@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	domain "github.com/slidebolt/sb-domain"
@@ -36,12 +37,12 @@ type AlexaEndpoint struct {
 
 // AlexaCapability describes an Alexa interface supported by an endpoint.
 type AlexaCapability struct {
-	Type          string            `json:"type"`
-	Interface     string            `json:"interface"`
-	Version       string            `json:"version"`
-	Instance      string            `json:"instance,omitempty"`
-	Properties    *AlexaProperties  `json:"properties,omitempty"`
-	Configuration map[string]any    `json:"configuration,omitempty"`
+	Type          string           `json:"type"`
+	Interface     string           `json:"interface"`
+	Version       string           `json:"version"`
+	Instance      string           `json:"instance,omitempty"`
+	Properties    *AlexaProperties `json:"properties,omitempty"`
+	Configuration map[string]any   `json:"configuration,omitempty"`
 }
 
 // AlexaProperties describes the properties for a capability.
@@ -107,9 +108,9 @@ func rangeCap(instance string, min, max float64) AlexaCapability {
 func prop(namespace, name string, value any) AlexaProperty {
 	return AlexaProperty{
 		Namespace:                 namespace,
-		Name:                     name,
-		Value:                    value,
-		TimeOfSample:             time.Now().UTC().Format(time.RFC3339),
+		Name:                      name,
+		Value:                     value,
+		TimeOfSample:              time.Now().UTC().Format(time.RFC3339),
 		UncertaintyInMilliseconds: 500,
 	}
 }
@@ -118,6 +119,44 @@ func propWithInstance(namespace, name, instance string, value any) AlexaProperty
 	p := prop(namespace, name, value)
 	p.Instance = instance
 	return p
+}
+
+func lightHasExplicitColorTemperatureMode(s domain.Light) bool {
+	switch s.ColorMode {
+	case "color_temp", "cold_warm_white":
+		return true
+	default:
+		return false
+	}
+}
+
+func lightSupportsRGB(entity domain.Entity, s domain.Light) bool {
+	hasStateRGB := len(s.RGB) == 3 || len(s.HS) == 2 || len(s.XY) == 2 || len(s.RGBW) == 4 || len(s.RGBWW) == 5 || strings.HasPrefix(s.ColorMode, "rgb")
+	if hasStateRGB {
+		return true
+	}
+	if lightHasExplicitColorTemperatureMode(s) && s.Temperature > 0 {
+		return false
+	}
+	for _, cmd := range entity.Commands {
+		switch cmd {
+		case "light_set_rgb", "light_set_rgbw", "light_set_rgbww":
+			return true
+		}
+	}
+	return false
+}
+
+func lightSupportsColorTemperature(entity domain.Entity, s domain.Light) bool {
+	if s.Temperature > 0 || lightHasExplicitColorTemperatureMode(s) {
+		return true
+	}
+	for _, cmd := range entity.Commands {
+		if cmd == "light_set_color_temp" {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -139,10 +178,10 @@ func ToAlexa(entity domain.Entity) AlexaEndpoint {
 		s, _ := entity.State.(domain.Light)
 		ep.Capabilities = append(ep.Capabilities, cap("Alexa.PowerController", "powerState"))
 		ep.Capabilities = append(ep.Capabilities, cap("Alexa.BrightnessController", "brightness"))
-		if len(s.RGB) == 3 || len(s.HS) == 2 || len(s.XY) == 2 {
+		if lightSupportsRGB(entity, s) {
 			ep.Capabilities = append(ep.Capabilities, cap("Alexa.ColorController", "color"))
 		}
-		if s.Temperature > 0 {
+		if lightSupportsColorTemperature(entity, s) {
 			ep.Capabilities = append(ep.Capabilities, cap("Alexa.ColorTemperatureController", "colorTemperatureInKelvin"))
 		}
 		ep.Capabilities = append(ep.Capabilities, cap("Alexa.EndpointHealth", "connectivity"))

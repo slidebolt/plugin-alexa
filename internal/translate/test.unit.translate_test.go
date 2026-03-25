@@ -59,10 +59,10 @@ func TestDecode_Switch(t *testing.T) {
 
 func TestDecode_Cover(t *testing.T) {
 	tests := []struct {
-		name     string
-		raw      string
-		wantOK   bool
-		wantPos  int
+		name    string
+		raw     string
+		wantOK  bool
+		wantPos int
 	}{
 		{"normal", `{"position":75}`, true, 75},
 		{"clamp high", `{"position":150}`, true, 100},
@@ -288,6 +288,26 @@ func TestToAlexa_Climate(t *testing.T) {
 	ep := ToAlexa(entity)
 	if ep.DisplayCategories[0] != "THERMOSTAT" {
 		t.Errorf("DisplayCategories: got %v", ep.DisplayCategories)
+	}
+}
+
+func TestToAlexa_LightColorTempOnlyFromCommands(t *testing.T) {
+	entity := domain.Entity{
+		ID: "group1", Plugin: "plugin-automation", DeviceID: "group",
+		Type: "light", Name: "BasementMovieRoomEdison",
+		Commands: []string{"light_turn_on", "light_turn_off", "light_set_brightness", "light_set_color_temp"},
+		State:    domain.Light{Power: false, Brightness: 0},
+	}
+	ep := ToAlexa(entity)
+	found := map[string]bool{}
+	for _, c := range ep.Capabilities {
+		found[c.Interface] = true
+	}
+	if !found["Alexa.ColorTemperatureController"] {
+		t.Fatal("missing Alexa.ColorTemperatureController capability")
+	}
+	if found["Alexa.ColorController"] {
+		t.Fatal("unexpected Alexa.ColorController capability")
 	}
 }
 

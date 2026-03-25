@@ -31,8 +31,8 @@ func (a *App) handleCommand(addr messenger.Address, cmd any) {
 		return
 	}
 
-	if a.srv != nil {
-		a.srv.BroadcastChangeReport(updated)
+	if a.client != nil {
+		a.client.BroadcastChangeReport(updated)
 	}
 }
 
