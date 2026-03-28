@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"sync"
 
 	contract "github.com/slidebolt/sb-contract"
 	domain "github.com/slidebolt/sb-domain"
@@ -88,9 +87,13 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 	return nil, nil
 }
 
-// capFingerprint returns a JSON string of the entity's Alexa capabilities,
+// alexaFingerprint returns a JSON string of the entity's Alexa capabilities,
 // used to detect when the capability set changes (as opposed to just state).
-func capFingerprint(entity domain.Entity) string {
+func alexaFingerprint(data json.RawMessage) string {
+	var entity domain.Entity
+	if err := json.Unmarshal(data, &entity); err != nil {
+		return ""
+	}
 	caps := translate.ToAlexa(entity).Capabilities
 	b, _ := json.Marshal(caps)
 	return string(b)
@@ -99,10 +102,6 @@ func capFingerprint(entity domain.Entity) string {
 // startAlexaWatch sets up a storage.Watch for entities labeled PluginAlexa and
 // pushes state updates for each one via the client — including entities
 // that already exist in storage before the watch starts.
-//
-// It maintains a cache of each entity's Alexa capability fingerprint so that
-// state-only changes produce a lightweight ChangeReport, while capability
-// changes trigger a full UpsertDevice (which flows to AddOrUpdateReport).
 func startAlexaWatch(msg messenger.Messenger, store storage.Storage, reporter changeReporter) error {
 	alexaQuery := storage.Query{
 		Where: []storage.Filter{
@@ -110,36 +109,38 @@ func startAlexaWatch(msg messenger.Messenger, store storage.Storage, reporter ch
 		},
 	}
 
-	var capMu sync.Mutex
-	capCache := map[string]string{} // entityKey → capability fingerprint
-
-	// handleEntity compares the entity's current capabilities against the
-	// cached fingerprint. If capabilities changed (or never seen), it calls
-	// UpsertDevice; otherwise it calls BroadcastChangeReport.
-	handleEntity := func(_ string, data json.RawMessage) {
+	// handleAdd triggers a full UpsertDevice for any new entity found by the watch.
+	handleAdd := func(_ string, data json.RawMessage) {
 		var entity domain.Entity
 		if err := json.Unmarshal(data, &entity); err != nil {
 			return
 		}
-
-		fp := capFingerprint(entity)
-		key := entity.Key()
-
-		capMu.Lock()
-		prev, exists := capCache[key]
-		capCache[key] = fp
-		capMu.Unlock()
-
-		if !exists || prev != fp {
-			reporter.UpsertDevice(entity)
-		} else {
-			reporter.BroadcastChangeReport(entity)
-		}
+		reporter.UpsertDevice(entity)
 	}
 
-	_, err := storage.Watch(msg, alexaQuery, storage.WatchHandlers{
-		OnAdd:    handleEntity,
-		OnUpdate: handleEntity,
+	// handleUpdate triggers a full UpsertDevice for a capability change.
+	handleUpdate := func(_ string, data json.RawMessage) {
+		var entity domain.Entity
+		if err := json.Unmarshal(data, &entity); err != nil {
+			return
+		}
+		reporter.UpsertDevice(entity)
+	}
+
+	// handleState triggers a lightweight ChangeReport for state-only updates.
+	handleState := func(_ string, data json.RawMessage) {
+		var entity domain.Entity
+		if err := json.Unmarshal(data, &entity); err != nil {
+			return
+		}
+		reporter.BroadcastChangeReport(entity)
+	}
+
+	w, err := storage.Watch(msg, alexaQuery, storage.WatchHandlers{
+		OnAdd:              handleAdd,
+		OnCapabilityUpdate: handleUpdate,
+		OnStateUpdate:      handleState,
+		Fingerprint:        alexaFingerprint,
 	})
 	if err != nil {
 		return fmt.Errorf("watch alexa entities: %w", err)
@@ -156,10 +157,7 @@ func startAlexaWatch(msg messenger.Messenger, store storage.Storage, reporter ch
 		if err := json.Unmarshal(entry.Data, &entity); err != nil {
 			continue
 		}
-		fp := capFingerprint(entity)
-		capMu.Lock()
-		capCache[entity.Key()] = fp
-		capMu.Unlock()
+		w.Populate(entry.Key, entry.Data)
 		reporter.UpsertDevice(entity)
 	}
 

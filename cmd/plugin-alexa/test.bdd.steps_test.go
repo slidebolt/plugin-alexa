@@ -573,7 +573,7 @@ func (c *bddCtx) lightTemperatureIs(expected int) error {
 	if !ok {
 		return fmt.Errorf("state type: got %T, want domain.Light", c.lastEntity.State)
 	}
-	if st.Temperature != float64(expected) {
+	if st.Temperature != expected {
 		return fmt.Errorf("light.Temperature: got %v, want %v", st.Temperature, expected)
 	}
 	return nil
