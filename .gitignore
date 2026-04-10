@@ -35,3 +35,4 @@ build/
 bin/
 /plugin-alexa
 /sb-plugin-alexa
+!.env.example
