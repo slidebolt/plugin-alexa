@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"log"
 
+	translate "github.com/slidebolt/plugin-alexa/internal/translate"
 	contract "github.com/slidebolt/sb-contract"
 	domain "github.com/slidebolt/sb-domain"
 	messenger "github.com/slidebolt/sb-messenger-sdk"
-	translate "github.com/slidebolt/plugin-alexa/internal/translate"
 	storage "github.com/slidebolt/sb-storage-sdk"
 )
 
@@ -110,29 +110,32 @@ func startAlexaWatch(msg messenger.Messenger, store storage.Storage, reporter ch
 	}
 
 	// handleAdd triggers a full UpsertDevice for any new entity found by the watch.
-	handleAdd := func(_ string, data json.RawMessage) {
+	handleAdd := func(key string, data json.RawMessage) {
 		var entity domain.Entity
 		if err := json.Unmarshal(data, &entity); err != nil {
 			return
 		}
+		log.Printf("plugin-alexa: watch add key=%s name=%q type=%s commands=%v labels=%v", key, entity.Name, entity.Type, entity.Commands, entity.Labels)
 		reporter.UpsertDevice(entity)
 	}
 
 	// handleUpdate triggers a full UpsertDevice for a capability change.
-	handleUpdate := func(_ string, data json.RawMessage) {
+	handleUpdate := func(key string, data json.RawMessage) {
 		var entity domain.Entity
 		if err := json.Unmarshal(data, &entity); err != nil {
 			return
 		}
+		log.Printf("plugin-alexa: watch capability_update key=%s name=%q type=%s commands=%v labels=%v", key, entity.Name, entity.Type, entity.Commands, entity.Labels)
 		reporter.UpsertDevice(entity)
 	}
 
 	// handleState triggers a lightweight ChangeReport for state-only updates.
-	handleState := func(_ string, data json.RawMessage) {
+	handleState := func(key string, data json.RawMessage) {
 		var entity domain.Entity
 		if err := json.Unmarshal(data, &entity); err != nil {
 			return
 		}
+		log.Printf("plugin-alexa: watch state_update key=%s name=%q type=%s", key, entity.Name, entity.Type)
 		reporter.BroadcastChangeReport(entity)
 	}
 
@@ -158,8 +161,10 @@ func startAlexaWatch(msg messenger.Messenger, store storage.Storage, reporter ch
 			continue
 		}
 		w.Populate(entry.Key, entry.Data)
+		log.Printf("plugin-alexa: watch populate key=%s name=%q type=%s commands=%v labels=%v", entry.Key, entity.Name, entity.Type, entity.Commands, entity.Labels)
 		reporter.UpsertDevice(entity)
 	}
+	log.Printf("plugin-alexa: watch initialized with %d PluginAlexa entities", len(entries))
 
 	return nil
 }

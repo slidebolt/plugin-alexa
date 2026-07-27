@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	translate "github.com/slidebolt/plugin-alexa/internal/translate"
 	domain "github.com/slidebolt/sb-domain"
 	messenger "github.com/slidebolt/sb-messenger-sdk"
-	translate "github.com/slidebolt/plugin-alexa/internal/translate"
 	storage "github.com/slidebolt/sb-storage-sdk"
 )
 
@@ -26,23 +26,23 @@ const (
 
 // relayRequest is the envelope for messages sent TO the AWS relay.
 type relayRequest struct {
-	Action   string              `json:"action"`
-	ClientID string              `json:"clientId,omitempty"`
-	Secret   string              `json:"secret,omitempty"`
+	Action   string                   `json:"action"`
+	ClientID string                   `json:"clientId,omitempty"`
+	Secret   string                   `json:"secret,omitempty"`
 	Endpoint *translate.AlexaEndpoint `json:"endpoint,omitempty"`
-	State    map[string]any      `json:"state,omitempty"`
-	DeviceID string              `json:"deviceId,omitempty"`
+	State    map[string]any           `json:"state,omitempty"`
+	DeviceID string                   `json:"deviceId,omitempty"`
 }
 
 // relayResponse is the envelope for messages received FROM the AWS relay.
 type relayResponse struct {
-	OK           *bool          `json:"ok,omitempty"`
-	Error        string         `json:"error,omitempty"`
-	ConnectionID string         `json:"connectionId,omitempty"`
-	DeviceID     string         `json:"deviceId,omitempty"`
-	Devices      []any          `json:"devices,omitempty"`
-	Type         string         `json:"type,omitempty"`         // "alexaDirective" for pushed directives
-	Directive    *awsDirective  `json:"directive,omitempty"`
+	OK           *bool         `json:"ok,omitempty"`
+	Error        string        `json:"error,omitempty"`
+	ConnectionID string        `json:"connectionId,omitempty"`
+	DeviceID     string        `json:"deviceId,omitempty"`
+	Devices      []any         `json:"devices,omitempty"`
+	Type         string        `json:"type,omitempty"` // "alexaDirective" for pushed directives
+	Directive    *awsDirective `json:"directive,omitempty"`
 }
 
 // awsDirective is an Alexa directive pushed by the SmartHome Lambda.
@@ -120,7 +120,7 @@ func (c *alexaClient) BroadcastChangeReport(entity domain.Entity) {
 	}
 
 	state := alexaStatePayload(props)
-	log.Printf("plugin-alexa: state_update %s (%d properties)", entity.Key(), len(props))
+	log.Printf("plugin-alexa: state_update send key=%s endpoint_id=%s name=%q type=%s properties=%d", entity.Key(), entity.Key(), entity.Name, entity.Type, len(props))
 	c.send(relayRequest{
 		Action:   "state_update",
 		ClientID: c.cfg.ClientID,
@@ -135,7 +135,7 @@ func (c *alexaClient) UpsertDevice(entity domain.Entity) {
 	props := translate.AlexaState(entity)
 	state := alexaStatePayload(props)
 
-	log.Printf("plugin-alexa: device_upsert %s (%s)", entity.Key(), entity.Name)
+	log.Printf("plugin-alexa: device_upsert send key=%s endpoint_id=%s friendly_name=%q type=%s capabilities=%d state_properties=%d", entity.Key(), ep.EndpointID, ep.FriendlyName, entity.Type, len(ep.Capabilities), len(props))
 	c.send(relayRequest{
 		Action:   "device_upsert",
 		ClientID: c.cfg.ClientID,
@@ -215,7 +215,7 @@ func (c *alexaClient) connectAndRun() error {
 	if err := c.register(conn); err != nil {
 		return fmt.Errorf("register: %w", err)
 	}
-	log.Printf("plugin-alexa: registered as %s", c.cfg.ClientID)
+	log.Printf("plugin-alexa: register ok client_id=%s", c.cfg.ClientID)
 
 	// 3. Sync all PluginAlexa-labeled entities as device_upserts.
 	if err := c.syncDevices(conn); err != nil {
@@ -273,6 +273,7 @@ func (c *alexaClient) syncDevices(conn *websocket.Conn) error {
 		ep := translate.ToAlexa(entity)
 		props := translate.AlexaState(entity)
 		state := alexaStatePayload(props)
+		log.Printf("plugin-alexa: device_upsert send key=%s endpoint_id=%s friendly_name=%q type=%s capabilities=%d state_properties=%d", entity.Key(), ep.EndpointID, ep.FriendlyName, entity.Type, len(ep.Capabilities), len(props))
 
 		msg := relayRequest{
 			Action:   "device_upsert",
@@ -293,6 +294,8 @@ func (c *alexaClient) syncDevices(conn *websocket.Conn) error {
 		}
 		if resp.OK != nil && !*resp.OK {
 			log.Printf("plugin-alexa: upsert %s rejected: %s", entity.Key(), resp.Error)
+		} else {
+			log.Printf("plugin-alexa: device_upsert ack key=%s endpoint_id=%s", entity.Key(), ep.EndpointID)
 		}
 	}
 
@@ -339,6 +342,10 @@ func (c *alexaClient) readLoop(conn *websocket.Conn) error {
 		// The relay pushes alexaDirective messages when Alexa sends a control command.
 		if msg.Type == "alexaDirective" && msg.Directive != nil {
 			c.handleDirective(msg.Directive)
+		} else if msg.Type != "" {
+			log.Printf("plugin-alexa: relay message type=%s ok=%v device_id=%s error=%q", msg.Type, msg.OK, msg.DeviceID, msg.Error)
+		} else if msg.OK != nil && !*msg.OK {
+			log.Printf("plugin-alexa: relay error device_id=%s error=%q", msg.DeviceID, msg.Error)
 		}
 		// Other messages (keepalive acks, state_update acks) are logged but not acted on.
 	}
@@ -355,6 +362,7 @@ func (c *alexaClient) handleDirective(d *awsDirective) {
 		log.Printf("plugin-alexa: entity not found for %q: %v", endpointID, err)
 		return
 	}
+	log.Printf("plugin-alexa: directive resolved endpoint_id=%s key=%s name=%q type=%s", endpointID, entity.Key(), entity.Name, entity.Type)
 
 	payload := d.Payload
 	if payload == nil {
@@ -369,13 +377,18 @@ func (c *alexaClient) handleDirective(d *awsDirective) {
 		log.Printf("plugin-alexa: fromAlexa %s/%s: %v", d.Header.Namespace, d.Header.Name, err)
 		return
 	}
+	log.Printf("plugin-alexa: directive translated endpoint_id=%s command=%T", endpointID, cmd)
 
 	// Route the command to the entity's owning plugin via messenger.
 	if actionCmd, ok := cmd.(messenger.Action); ok && c.cmds != nil {
 		target := domain.EntityKey{Plugin: entity.Plugin, DeviceID: entity.DeviceID, ID: entity.ID}
 		if err := c.cmds.Send(target, actionCmd); err != nil {
 			log.Printf("plugin-alexa: route command to %s: %v", target.Key(), err)
+			return
 		}
+		log.Printf("plugin-alexa: route command ok target=%s command=%T", target.Key(), actionCmd)
+	} else {
+		log.Printf("plugin-alexa: directive command not routable endpoint_id=%s command=%T cmds_available=%t", endpointID, cmd, c.cmds != nil)
 	}
 }
 
