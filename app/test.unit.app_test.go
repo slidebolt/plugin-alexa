@@ -18,23 +18,28 @@ package app
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
+	translate "github.com/slidebolt/plugin-alexa/internal/translate"
 	domain "github.com/slidebolt/sb-domain"
-	testkit "github.com/slidebolt/sb-testkit"
 	messenger "github.com/slidebolt/sb-messenger-sdk"
 	storage "github.com/slidebolt/sb-storage-sdk"
+	testkit "github.com/slidebolt/sb-testkit"
 )
 
 // reportCall records which method was called and with which entity.
 type reportCall struct {
-	method string // "change" or "upsert"
+	method string // "change", "upsert", or "delete"
 	entity domain.Entity
 }
 
-// mockReporter records BroadcastChangeReport and UpsertDevice calls for testing.
+// mockReporter records Alexa watcher calls for testing.
 type mockReporter struct {
 	mu    sync.Mutex
 	seen  []domain.Entity
@@ -53,6 +58,13 @@ func (r *mockReporter) UpsertDevice(e domain.Entity) {
 	defer r.mu.Unlock()
 	r.seen = append(r.seen, e)
 	r.calls = append(r.calls, reportCall{method: "upsert", entity: e})
+}
+
+func (r *mockReporter) DeleteDevice(e domain.Entity) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen = append(r.seen, e)
+	r.calls = append(r.calls, reportCall{method: "delete", entity: e})
 }
 
 func (r *mockReporter) wait(t *testing.T, count int) []domain.Entity {
@@ -195,6 +207,69 @@ func sendAndReceive(t *testing.T, cmds *messenger.Commands, entity domain.Entity
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for command")
 		return nil
+	}
+}
+
+func newTestRelayClient(t *testing.T) (*alexaClient, <-chan relayRequest, func()) {
+	t.Helper()
+	upgrader := websocket.Upgrader{}
+	received := make(chan relayRequest, 20)
+	done := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Logf("upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		for {
+			var msg relayRequest
+			if err := conn.ReadJSON(&msg); err != nil {
+				return
+			}
+			select {
+			case received <- msg:
+			case <-done:
+				return
+			}
+		}
+	}))
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		server.Close()
+		t.Fatalf("dial websocket: %v", err)
+	}
+	client := newClient(Config{ClientID: "client-1"}, nil, nil)
+	client.conn = conn
+	cleanup := func() {
+		close(done)
+		conn.Close()
+		server.Close()
+	}
+	return client, received, cleanup
+}
+
+func expectRelayMessage(t *testing.T, received <-chan relayRequest, action string) relayRequest {
+	t.Helper()
+	select {
+	case msg := <-received:
+		if msg.Action != action {
+			t.Fatalf("relay action: got %q, want %q", msg.Action, action)
+		}
+		return msg
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for relay action %q", action)
+		return relayRequest{}
+	}
+}
+
+func expectNoRelayMessage(t *testing.T, received <-chan relayRequest) {
+	t.Helper()
+	select {
+	case msg := <-received:
+		t.Fatalf("unexpected relay message: %+v", msg)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -753,8 +828,12 @@ func TestAlexaWatch_UpsertsOnCapabilityChange(t *testing.T) {
 	store := e.Storage()
 
 	// Save a brightness-only light with the PluginAlexa label.
-	saveAlexaEntity(t, store, "test", "dev1", "light3", "Movie Room",
+	ent := saveAlexaEntity(t, store, "test", "dev1", "light3", "Movie Room",
 		domain.Light{Power: true, Brightness: 200})
+	ent.Commands = []string{"light_turn_on", "light_turn_off", "light_set_brightness"}
+	if err := store.Save(ent); err != nil {
+		t.Fatal(err)
+	}
 
 	reporter := &mockReporter{}
 	if err := startAlexaWatch(msg, store, reporter); err != nil {
@@ -764,12 +843,14 @@ func TestAlexaWatch_UpsertsOnCapabilityChange(t *testing.T) {
 	// Wait for the initial UpsertDevice from the pre-existing entity scan.
 	reporter.waitCalls(t, 1)
 
-	// Now update the entity: add color temperature mode. This changes
+	// Now update the entity: add a color temperature command. This changes
 	// the Alexa capabilities (adds ColorTemperatureController).
-	ent := domain.Entity{
+	ent = domain.Entity{
 		ID: "light3", Plugin: "test", DeviceID: "dev1",
-		Type: "light", Name: "Movie Room",
-		State: domain.Light{Power: true, Brightness: 200, ColorMode: "color_temp", Temperature: 300},
+		Type:     "light",
+		Name:     "Movie Room",
+		Commands: []string{"light_turn_on", "light_turn_off", "light_set_brightness", "light_set_color_temp"},
+		State:    domain.Light{Power: true, Brightness: 200, ColorMode: "color_temp", Temperature: 300},
 	}
 	if err := store.Save(ent); err != nil {
 		t.Fatal(err)
@@ -798,8 +879,12 @@ func TestAlexaWatch_StateOnlyChangeStillBroadcasts(t *testing.T) {
 	store := e.Storage()
 
 	// Save a light with the PluginAlexa label.
-	saveAlexaEntity(t, store, "test", "dev1", "light4", "Hallway",
+	ent := saveAlexaEntity(t, store, "test", "dev1", "light4", "Hallway",
 		domain.Light{Power: true, Brightness: 100})
+	ent.Commands = []string{"light_turn_on", "light_turn_off", "light_set_brightness"}
+	if err := store.Save(ent); err != nil {
+		t.Fatal(err)
+	}
 
 	reporter := &mockReporter{}
 	if err := startAlexaWatch(msg, store, reporter); err != nil {
@@ -810,10 +895,12 @@ func TestAlexaWatch_StateOnlyChangeStillBroadcasts(t *testing.T) {
 	reporter.waitCalls(t, 1)
 
 	// Update brightness only — no capability change.
-	ent := domain.Entity{
+	ent = domain.Entity{
 		ID: "light4", Plugin: "test", DeviceID: "dev1",
-		Type: "light", Name: "Hallway",
-		State: domain.Light{Power: true, Brightness: 200},
+		Type:     "light",
+		Name:     "Hallway",
+		Commands: []string{"light_turn_on", "light_turn_off", "light_set_brightness"},
+		State:    domain.Light{Power: true, Brightness: 200},
 	}
 	if err := store.Save(ent); err != nil {
 		t.Fatal(err)
@@ -826,4 +913,143 @@ func TestAlexaWatch_StateOnlyChangeStillBroadcasts(t *testing.T) {
 	if second.method != "change" {
 		t.Errorf("state-only change: got method %q, want \"change\"", second.method)
 	}
+}
+
+func TestAlexaWatch_DeletesWhenAlexaLabelRemoved(t *testing.T) {
+	e := testkit.NewTestEnv(t)
+	e.Start("messenger")
+	e.Start("storage")
+	msg := e.Messenger()
+	store := e.Storage()
+
+	key := domain.EntityKey{Plugin: "test", DeviceID: "dev1", ID: "light5"}
+	saveAlexaEntity(t, store, "test", "dev1", "light5", "Movie Room Edison",
+		domain.Light{Power: true, Brightness: 100})
+
+	reporter := &mockReporter{}
+	if err := startAlexaWatch(msg, store, reporter); err != nil {
+		t.Fatal(err)
+	}
+	reporter.waitCalls(t, 1)
+
+	if err := store.SetProfile(key, json.RawMessage(`{"labels":{"PluginHomeassistant":["true"]}}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := reporter.waitCalls(t, 2)
+	second := calls[1]
+	if second.method != "delete" {
+		t.Errorf("label removal: got method %q, want \"delete\"", second.method)
+	}
+	if second.entity.ID != "light5" {
+		t.Errorf("entity ID: got %q, want light5", second.entity.ID)
+	}
+}
+
+func TestAlexaStateFingerprintIgnoresTimestampsAndPropertyOrder(t *testing.T) {
+	a := []translate.AlexaProperty{
+		{Namespace: "Alexa.PowerController", Name: "powerState", Value: "ON", TimeOfSample: "2026-01-01T00:00:00Z", UncertaintyInMilliseconds: 500},
+		{Namespace: "Alexa.BrightnessController", Name: "brightness", Value: 100, TimeOfSample: "2026-01-01T00:00:00Z", UncertaintyInMilliseconds: 500},
+	}
+	b := []translate.AlexaProperty{
+		{Namespace: "Alexa.BrightnessController", Name: "brightness", Value: 100, TimeOfSample: "2026-02-01T00:00:00Z", UncertaintyInMilliseconds: 1000},
+		{Namespace: "Alexa.PowerController", Name: "powerState", Value: "ON", TimeOfSample: "2026-02-01T00:00:00Z", UncertaintyInMilliseconds: 1000},
+	}
+	if alexaStateFingerprint(a) != alexaStateFingerprint(b) {
+		t.Fatal("same values with different timestamps/order should have same fingerprint")
+	}
+}
+
+func TestAlexaStateFingerprintChangesWhenAlexaVisibleValueChanges(t *testing.T) {
+	a := []translate.AlexaProperty{
+		{Namespace: "Alexa.PowerController", Name: "powerState", Value: "ON"},
+		{Namespace: "Alexa.BrightnessController", Name: "brightness", Value: 100},
+	}
+	b := []translate.AlexaProperty{
+		{Namespace: "Alexa.PowerController", Name: "powerState", Value: "ON"},
+		{Namespace: "Alexa.BrightnessController", Name: "brightness", Value: 99},
+	}
+	if alexaStateFingerprint(a) == alexaStateFingerprint(b) {
+		t.Fatal("changed brightness should produce a different fingerprint")
+	}
+}
+
+func TestAlexaClientBroadcastSkipsUnchangedState(t *testing.T) {
+	client, received, cleanup := newTestRelayClient(t)
+	defer cleanup()
+
+	entity := domain.Entity{
+		ID: "basement", Plugin: "plugin-automation", DeviceID: "group",
+		Type:  "light",
+		Name:  "Basement",
+		State: domain.Light{Power: true, Brightness: 254, Temperature: 370},
+	}
+
+	client.BroadcastChangeReport(entity)
+	expectRelayMessage(t, received, "state_update")
+
+	client.BroadcastChangeReport(entity)
+	expectNoRelayMessage(t, received)
+
+	entity.State = domain.Light{Power: true, Brightness: 200, Temperature: 370}
+	client.BroadcastChangeReport(entity)
+	expectRelayMessage(t, received, "state_update")
+}
+
+func TestAlexaClientUpsertSeedsStateCache(t *testing.T) {
+	client, received, cleanup := newTestRelayClient(t)
+	defer cleanup()
+
+	entity := domain.Entity{
+		ID: "basement", Plugin: "plugin-automation", DeviceID: "group",
+		Type:  "light",
+		Name:  "Basement",
+		State: domain.Light{Power: true, Brightness: 254, Temperature: 370},
+	}
+
+	client.UpsertDevice(entity)
+	expectRelayMessage(t, received, "device_upsert")
+
+	client.BroadcastChangeReport(entity)
+	expectNoRelayMessage(t, received)
+}
+
+func TestAlexaClientFailedSendDoesNotAdvanceStateCache(t *testing.T) {
+	client := newClient(Config{ClientID: "client-1"}, nil, nil)
+	entity := domain.Entity{
+		ID: "basement", Plugin: "plugin-automation", DeviceID: "group",
+		Type:  "light",
+		Name:  "Basement",
+		State: domain.Light{Power: true, Brightness: 254},
+	}
+
+	client.BroadcastChangeReport(entity)
+
+	fingerprint := alexaStateFingerprint(translate.AlexaState(entity))
+	if !client.shouldSendState(entity.Key(), fingerprint) {
+		t.Fatal("failed/no-connection send should not advance state cache")
+	}
+}
+
+func TestAlexaClientDeleteClearsStateCache(t *testing.T) {
+	client, received, cleanup := newTestRelayClient(t)
+	defer cleanup()
+
+	entity := domain.Entity{
+		ID: "basement", Plugin: "plugin-automation", DeviceID: "group",
+		Type:  "light",
+		Name:  "Basement",
+		State: domain.Light{Power: true, Brightness: 254},
+	}
+
+	client.UpsertDevice(entity)
+	expectRelayMessage(t, received, "device_upsert")
+	client.BroadcastChangeReport(entity)
+	expectNoRelayMessage(t, received)
+
+	client.DeleteDevice(entity)
+	expectRelayMessage(t, received, "device_delete")
+
+	client.BroadcastChangeReport(entity)
+	expectRelayMessage(t, received, "state_update")
 }

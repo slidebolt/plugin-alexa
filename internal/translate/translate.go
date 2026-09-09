@@ -121,42 +121,52 @@ func propWithInstance(namespace, name, instance string, value any) AlexaProperty
 	return p
 }
 
-func lightHasExplicitColorTemperatureMode(s domain.Light) bool {
-	switch s.ColorMode {
-	case "color_temp", "cold_warm_white":
-		return true
-	default:
-		return false
+func hasCommand(entity domain.Entity, command string) bool {
+	for _, candidate := range entity.Commands {
+		if candidate == command {
+			return true
+		}
 	}
+	return false
 }
 
-func lightSupportsRGB(entity domain.Entity, s domain.Light) bool {
-	hasStateRGB := len(s.RGB) == 3 || len(s.HS) == 2 || len(s.XY) == 2 || len(s.RGBW) == 4 || len(s.RGBWW) == 5 || strings.HasPrefix(s.ColorMode, "rgb")
-	if hasStateRGB {
-		return true
-	}
-	if lightHasExplicitColorTemperatureMode(s) && s.Temperature > 0 {
-		return false
-	}
+func lightSupportsRGB(entity domain.Entity) bool {
 	for _, cmd := range entity.Commands {
 		switch cmd {
-		case "light_set_rgb", "light_set_rgbw", "light_set_rgbww":
+		case "light_set_rgb", "light_set_hs", "light_set_xy", "light_set_rgbw", "light_set_rgbww":
 			return true
 		}
 	}
 	return false
 }
 
-func lightSupportsColorTemperature(entity domain.Entity, s domain.Light) bool {
-	if s.Temperature > 0 || lightHasExplicitColorTemperatureMode(s) {
-		return true
+func lightSupportsColorTemperature(entity domain.Entity) bool {
+	return hasCommand(entity, "light_set_color_temp")
+}
+
+func kelvinToMireds(kelvin int) (int, error) {
+	if kelvin <= 0 {
+		return 0, fmt.Errorf("translate: colorTemperatureInKelvin %d must be positive", kelvin)
 	}
-	for _, cmd := range entity.Commands {
-		if cmd == "light_set_color_temp" {
-			return true
-		}
+	mireds := int(math.Round(1000000 / float64(kelvin)))
+	if mireds < 153 || mireds > 500 {
+		return 0, fmt.Errorf("translate: kelvin %d converts to mireds %d out of range [153,500]", kelvin, mireds)
 	}
-	return false
+	return mireds, nil
+}
+
+func miredsToKelvin(mireds int) int {
+	if mireds <= 0 {
+		return 0
+	}
+	return int(math.Round(1000000 / float64(mireds)))
+}
+
+func friendlyName(entity domain.Entity) string {
+	if entity.Profile != nil && strings.TrimSpace(entity.Profile.Name) != "" {
+		return entity.Profile.Name
+	}
+	return entity.Name
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +176,7 @@ func lightSupportsColorTemperature(entity domain.Entity, s domain.Light) bool {
 func ToAlexa(entity domain.Entity) AlexaEndpoint {
 	ep := AlexaEndpoint{
 		EndpointID:       entity.Key(),
-		FriendlyName:     entity.Name,
+		FriendlyName:     friendlyName(entity),
 		ManufacturerName: "SlideBolt",
 		Description:      entity.Type + " via SlideBolt",
 		Capabilities:     []AlexaCapability{cap("Alexa")},
@@ -175,13 +185,16 @@ func ToAlexa(entity domain.Entity) AlexaEndpoint {
 	switch entity.Type {
 	case "light":
 		ep.DisplayCategories = []string{"LIGHT"}
-		s, _ := entity.State.(domain.Light)
-		ep.Capabilities = append(ep.Capabilities, cap("Alexa.PowerController", "powerState"))
-		ep.Capabilities = append(ep.Capabilities, cap("Alexa.BrightnessController", "brightness"))
-		if lightSupportsRGB(entity, s) {
+		if hasCommand(entity, "light_turn_on") || hasCommand(entity, "light_turn_off") {
+			ep.Capabilities = append(ep.Capabilities, cap("Alexa.PowerController", "powerState"))
+		}
+		if hasCommand(entity, "light_set_brightness") {
+			ep.Capabilities = append(ep.Capabilities, cap("Alexa.BrightnessController", "brightness"))
+		}
+		if lightSupportsRGB(entity) {
 			ep.Capabilities = append(ep.Capabilities, cap("Alexa.ColorController", "color"))
 		}
-		if lightSupportsColorTemperature(entity, s) {
+		if lightSupportsColorTemperature(entity) {
 			ep.Capabilities = append(ep.Capabilities, cap("Alexa.ColorTemperatureController", "colorTemperatureInKelvin"))
 		}
 		ep.Capabilities = append(ep.Capabilities, cap("Alexa.EndpointHealth", "connectivity"))
@@ -367,7 +380,7 @@ func AlexaState(entity domain.Entity) []AlexaProperty {
 			}))
 		}
 		if s.Temperature > 0 {
-			props = append(props, prop("Alexa.ColorTemperatureController", "colorTemperatureInKelvin", s.Temperature))
+			props = append(props, prop("Alexa.ColorTemperatureController", "colorTemperatureInKelvin", miredsToKelvin(s.Temperature)))
 		}
 
 	case "switch":
@@ -489,13 +502,27 @@ func FromAlexa(entityType, namespace, name string, payload map[string]any) (any,
 			color, _ := payload["color"].(map[string]any)
 			hue := toFloat64(color["hue"])
 			sat := toFloat64(color["saturation"])
-			return domain.LightSetHS{Hue: hue, Saturation: sat * 100}, nil
+			brightness := 0
+			if _, ok := color["brightness"]; ok {
+				brightness = int(math.Round(toFloat64(color["brightness"]) * 254))
+				if brightness < 0 {
+					brightness = 0
+				}
+				if brightness > 254 {
+					brightness = 254
+				}
+			}
+			return domain.LightSetHS{Hue: hue, Saturation: sat * 100, Brightness: brightness}, nil
 		}
 
 	case "Alexa.ColorTemperatureController":
 		if name == "SetColorTemperature" {
 			kelvin := toInt(payload["colorTemperatureInKelvin"])
-			return domain.LightSetColorTemp{Mireds: kelvin}, nil
+			mireds, err := kelvinToMireds(kelvin)
+			if err != nil {
+				return nil, err
+			}
+			return domain.LightSetColorTemp{Mireds: mireds}, nil
 		}
 
 	case "Alexa.LockController":

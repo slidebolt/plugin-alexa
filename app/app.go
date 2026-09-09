@@ -19,6 +19,7 @@ const PluginID = "plugin-alexa"
 type changeReporter interface {
 	BroadcastChangeReport(domain.Entity)
 	UpsertDevice(domain.Entity)
+	DeleteDevice(domain.Entity)
 }
 
 // App is the importable runtime for the plugin-alexa binary.
@@ -139,8 +140,18 @@ func startAlexaWatch(msg messenger.Messenger, store storage.Storage, reporter ch
 		reporter.BroadcastChangeReport(entity)
 	}
 
+	handleRemove := func(key string, data json.RawMessage) {
+		var entity domain.Entity
+		if err := json.Unmarshal(data, &entity); err != nil {
+			return
+		}
+		log.Printf("plugin-alexa: watch remove key=%s name=%q type=%s", key, entity.Name, entity.Type)
+		reporter.DeleteDevice(entity)
+	}
+
 	w, err := storage.Watch(msg, alexaQuery, storage.WatchHandlers{
 		OnAdd:              handleAdd,
+		OnRemove:           handleRemove,
 		OnCapabilityUpdate: handleUpdate,
 		OnStateUpdate:      handleState,
 		Fingerprint:        alexaFingerprint,

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"sort"
 	"sync"
 	"time"
 
@@ -74,6 +75,8 @@ type alexaClient struct {
 	mu   sync.Mutex
 	conn *websocket.Conn
 
+	lastAlexaState map[string]string
+
 	stopCh chan struct{}
 	doneCh chan struct{}
 
@@ -83,11 +86,12 @@ type alexaClient struct {
 
 func newClient(cfg Config, store storage.Storage, cmds *messenger.Commands) *alexaClient {
 	return &alexaClient{
-		cfg:    cfg,
-		store:  store,
-		cmds:   cmds,
-		stopCh: make(chan struct{}),
-		doneCh: make(chan struct{}),
+		cfg:            cfg,
+		store:          store,
+		cmds:           cmds,
+		lastAlexaState: make(map[string]string),
+		stopCh:         make(chan struct{}),
+		doneCh:         make(chan struct{}),
 	}
 }
 
@@ -119,14 +123,22 @@ func (c *alexaClient) BroadcastChangeReport(entity domain.Entity) {
 		return
 	}
 
+	fingerprint := alexaStateFingerprint(props)
+	if !c.shouldSendState(entity.Key(), fingerprint) {
+		log.Printf("plugin-alexa: state_update skip unchanged key=%s endpoint_id=%s name=%q type=%s properties=%d", entity.Key(), entity.Key(), entity.Name, entity.Type, len(props))
+		return
+	}
+
 	state := alexaStatePayload(props)
 	log.Printf("plugin-alexa: state_update send key=%s endpoint_id=%s name=%q type=%s properties=%d", entity.Key(), entity.Key(), entity.Name, entity.Type, len(props))
-	c.send(relayRequest{
+	if c.send(relayRequest{
 		Action:   "state_update",
 		ClientID: c.cfg.ClientID,
 		DeviceID: entity.Key(),
 		State:    state,
-	})
+	}) {
+		c.markStateSent(entity.Key(), fingerprint)
+	}
 }
 
 // UpsertDevice pushes a device_upsert for an entity.
@@ -134,23 +146,28 @@ func (c *alexaClient) UpsertDevice(entity domain.Entity) {
 	ep := translate.ToAlexa(entity)
 	props := translate.AlexaState(entity)
 	state := alexaStatePayload(props)
+	fingerprint := alexaStateFingerprint(props)
 
 	log.Printf("plugin-alexa: device_upsert send key=%s endpoint_id=%s friendly_name=%q type=%s capabilities=%d state_properties=%d", entity.Key(), ep.EndpointID, ep.FriendlyName, entity.Type, len(ep.Capabilities), len(props))
-	c.send(relayRequest{
+	if c.send(relayRequest{
 		Action:   "device_upsert",
 		ClientID: c.cfg.ClientID,
 		Endpoint: &ep,
 		State:    state,
-	})
+	}) {
+		c.markStateSent(entity.Key(), fingerprint)
+	}
 }
 
 // DeleteDevice pushes a device_delete for an entity.
 func (c *alexaClient) DeleteDevice(entity domain.Entity) {
-	c.send(relayRequest{
+	if c.send(relayRequest{
 		Action:   "device_delete",
 		ClientID: c.cfg.ClientID,
 		DeviceID: entity.Key(),
-	})
+	}) {
+		c.clearState(entity.Key())
+	}
 }
 
 // --- connection lifecycle ---
@@ -273,6 +290,7 @@ func (c *alexaClient) syncDevices(conn *websocket.Conn) error {
 		ep := translate.ToAlexa(entity)
 		props := translate.AlexaState(entity)
 		state := alexaStatePayload(props)
+		fingerprint := alexaStateFingerprint(props)
 		log.Printf("plugin-alexa: device_upsert send key=%s endpoint_id=%s friendly_name=%q type=%s capabilities=%d state_properties=%d", entity.Key(), ep.EndpointID, ep.FriendlyName, entity.Type, len(ep.Capabilities), len(props))
 
 		msg := relayRequest{
@@ -295,6 +313,7 @@ func (c *alexaClient) syncDevices(conn *websocket.Conn) error {
 		if resp.OK != nil && !*resp.OK {
 			log.Printf("plugin-alexa: upsert %s rejected: %s", entity.Key(), resp.Error)
 		} else {
+			c.markStateSent(entity.Key(), fingerprint)
 			log.Printf("plugin-alexa: device_upsert ack key=%s endpoint_id=%s", entity.Key(), ep.EndpointID)
 		}
 	}
@@ -371,13 +390,16 @@ func (c *alexaClient) handleDirective(d *awsDirective) {
 	if d.Header.Instance != "" {
 		payload["_instance"] = d.Header.Instance
 	}
+	if d.Header.Namespace == "Alexa.ColorTemperatureController" && d.Header.Name == "SetColorTemperature" {
+		log.Printf("plugin-alexa: directive payload endpoint_id=%s colorTemperatureInKelvin=%v", endpointID, payload["colorTemperatureInKelvin"])
+	}
 
 	cmd, err := translate.FromAlexa(entity.Type, d.Header.Namespace, d.Header.Name, payload)
 	if err != nil {
 		log.Printf("plugin-alexa: fromAlexa %s/%s: %v", d.Header.Namespace, d.Header.Name, err)
 		return
 	}
-	log.Printf("plugin-alexa: directive translated endpoint_id=%s command=%T", endpointID, cmd)
+	log.Printf("plugin-alexa: directive translated endpoint_id=%s command=%T %s", endpointID, cmd, commandLogDetails(cmd))
 
 	// Route the command to the entity's owning plugin via messenger.
 	if actionCmd, ok := cmd.(messenger.Action); ok && c.cmds != nil {
@@ -386,9 +408,24 @@ func (c *alexaClient) handleDirective(d *awsDirective) {
 			log.Printf("plugin-alexa: route command to %s: %v", target.Key(), err)
 			return
 		}
-		log.Printf("plugin-alexa: route command ok target=%s command=%T", target.Key(), actionCmd)
+		log.Printf("plugin-alexa: route command ok target=%s action=%s command=%T %s", target.Key(), actionCmd.ActionName(), actionCmd, commandLogDetails(actionCmd))
 	} else {
 		log.Printf("plugin-alexa: directive command not routable endpoint_id=%s command=%T cmds_available=%t", endpointID, cmd, c.cmds != nil)
+	}
+}
+
+func commandLogDetails(cmd any) string {
+	switch c := cmd.(type) {
+	case domain.LightSetColorTemp:
+		return fmt.Sprintf("mireds=%d", c.Mireds)
+	case domain.LightSetBrightness:
+		return fmt.Sprintf("brightness=%d", c.Brightness)
+	case domain.LightSetHS:
+		return fmt.Sprintf("hue=%.1f saturation=%.1f brightness=%d", c.Hue, c.Saturation, c.Brightness)
+	case domain.LightSetRGB:
+		return fmt.Sprintf("r=%d g=%d b=%d brightness=%d", c.R, c.G, c.B, c.Brightness)
+	default:
+		return ""
 	}
 }
 
@@ -416,22 +453,72 @@ func (c *alexaClient) findEntityByEndpointID(endpointID string) (domain.Entity, 
 
 // --- send helper (thread-safe) ---
 
-func (c *alexaClient) send(msg relayRequest) {
+func (c *alexaClient) send(msg relayRequest) bool {
 	c.mu.Lock()
 	conn := c.conn
 	c.mu.Unlock()
 
 	if conn == nil {
-		return
+		return false
 	}
 
 	conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	if err := conn.WriteJSON(msg); err != nil {
 		log.Printf("plugin-alexa: send %s: %v", msg.Action, err)
+		return false
 	}
+	return true
 }
 
 // --- helpers ---
+
+type alexaStateFingerprintProperty struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+	Instance  string `json:"instance,omitempty"`
+	Value     any    `json:"value"`
+}
+
+func alexaStateFingerprint(props []translate.AlexaProperty) string {
+	canonical := make([]alexaStateFingerprintProperty, 0, len(props))
+	for _, p := range props {
+		canonical = append(canonical, alexaStateFingerprintProperty{
+			Namespace: p.Namespace,
+			Name:      p.Name,
+			Instance:  p.Instance,
+			Value:     p.Value,
+		})
+	}
+	sort.Slice(canonical, func(i, j int) bool {
+		if canonical[i].Namespace != canonical[j].Namespace {
+			return canonical[i].Namespace < canonical[j].Namespace
+		}
+		if canonical[i].Name != canonical[j].Name {
+			return canonical[i].Name < canonical[j].Name
+		}
+		return canonical[i].Instance < canonical[j].Instance
+	})
+	b, _ := json.Marshal(canonical)
+	return string(b)
+}
+
+func (c *alexaClient) shouldSendState(endpointID, fingerprint string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastAlexaState[endpointID] != fingerprint
+}
+
+func (c *alexaClient) markStateSent(endpointID, fingerprint string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastAlexaState[endpointID] = fingerprint
+}
+
+func (c *alexaClient) clearState(endpointID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.lastAlexaState, endpointID)
+}
 
 func alexaStatePayload(props []translate.AlexaProperty) map[string]any {
 	arr := make([]map[string]any, len(props))

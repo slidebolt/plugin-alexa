@@ -221,8 +221,10 @@ func TestEncode_BrightnessRange(t *testing.T) {
 func TestToAlexa_Light(t *testing.T) {
 	entity := domain.Entity{
 		ID: "light1", Plugin: "test", DeviceID: "dev1",
-		Type: "light", Name: "Test Light",
-		State: domain.Light{Power: true, Brightness: 200},
+		Type:     "light",
+		Name:     "Test Light",
+		Commands: []string{"light_turn_on", "light_turn_off", "light_set_brightness"},
+		State:    domain.Light{Power: true, Brightness: 200},
 	}
 	ep := ToAlexa(entity)
 	if ep.EndpointID != entity.Key() {
@@ -243,6 +245,20 @@ func TestToAlexa_Light(t *testing.T) {
 		if !found[want] {
 			t.Errorf("missing capability %q", want)
 		}
+	}
+}
+
+func TestToAlexa_UsesProfileNameWhenPresent(t *testing.T) {
+	entity := domain.Entity{
+		ID: "basementoffice", Plugin: "plugin-automation", DeviceID: "group",
+		Type:    "light",
+		Name:    "BasementOffice",
+		Profile: &domain.EntityProfile{Name: "Office", ID: "office"},
+		State:   domain.Light{Power: true, Brightness: 100},
+	}
+	ep := ToAlexa(entity)
+	if ep.FriendlyName != "Office" {
+		t.Errorf("FriendlyName: got %q, want %q", ep.FriendlyName, "Office")
 	}
 }
 
@@ -311,6 +327,50 @@ func TestToAlexa_LightColorTempOnlyFromCommands(t *testing.T) {
 	}
 }
 
+func TestToAlexa_LightHSCommandAdvertisesColorController(t *testing.T) {
+	entity := domain.Entity{
+		ID: "group1", Plugin: "plugin-automation", DeviceID: "group",
+		Type: "light", Name: "Basement",
+		Commands: []string{"light_turn_on", "light_turn_off", "light_set_brightness", "light_set_color_temp", "light_set_hs"},
+		State:    domain.Light{Power: false, Brightness: 0},
+	}
+	ep := ToAlexa(entity)
+	found := map[string]bool{}
+	for _, c := range ep.Capabilities {
+		found[c.Interface] = true
+	}
+	if !found["Alexa.ColorController"] {
+		t.Fatal("missing Alexa.ColorController capability")
+	}
+}
+
+func TestToAlexa_LightCapabilitiesIgnoreColorState(t *testing.T) {
+	entity := domain.Entity{
+		ID: "group1", Plugin: "plugin-automation", DeviceID: "group",
+		Type:     "light",
+		Name:     "Sparse Group",
+		Commands: []string{"light_turn_on", "light_turn_off", "light_set_brightness"},
+		State: domain.Light{
+			Power:       false,
+			Brightness:  0,
+			ColorMode:   "rgb",
+			RGB:         []int{233, 2, 255},
+			Temperature: 370,
+		},
+	}
+	ep := ToAlexa(entity)
+	found := map[string]bool{}
+	for _, c := range ep.Capabilities {
+		found[c.Interface] = true
+	}
+	if found["Alexa.ColorController"] {
+		t.Fatal("unexpected Alexa.ColorController capability from state")
+	}
+	if found["Alexa.ColorTemperatureController"] {
+		t.Fatal("unexpected Alexa.ColorTemperatureController capability from state")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // AlexaState tests
 // ---------------------------------------------------------------------------
@@ -333,6 +393,24 @@ func TestAlexaState_Light(t *testing.T) {
 	if !ok || b != 50 {
 		t.Errorf("brightness: got %v (expected 50)", found["Alexa.BrightnessController/brightness"])
 	}
+}
+
+func TestAlexaState_LightColorTemperatureReportsKelvin(t *testing.T) {
+	entity := domain.Entity{
+		ID: "light1", Plugin: "test", DeviceID: "dev1",
+		Type: "light", Name: "Test Light",
+		State: domain.Light{Power: true, Brightness: 127, Temperature: 370},
+	}
+	props := AlexaState(entity)
+	for _, p := range props {
+		if p.Namespace == "Alexa.ColorTemperatureController" && p.Name == "colorTemperatureInKelvin" {
+			if p.Value != 2703 {
+				t.Fatalf("colorTemperatureInKelvin: got %v, want 2703", p.Value)
+			}
+			return
+		}
+	}
+	t.Fatal("missing colorTemperatureInKelvin property")
 }
 
 func TestAlexaState_Lock(t *testing.T) {
@@ -423,6 +501,34 @@ func TestFromAlexa_ColorController(t *testing.T) {
 	}
 	if hs.Saturation != 50 {
 		t.Errorf("saturation: got %v, want 50", hs.Saturation)
+	}
+	if hs.Brightness != 254 {
+		t.Errorf("brightness: got %d, want 254", hs.Brightness)
+	}
+}
+
+func TestFromAlexa_ColorTemperatureControllerConvertsKelvinToMireds(t *testing.T) {
+	cmd, err := FromAlexa("light", "Alexa.ColorTemperatureController", "SetColorTemperature", map[string]any{
+		"colorTemperatureInKelvin": float64(2700),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct, ok := cmd.(domain.LightSetColorTemp)
+	if !ok {
+		t.Fatalf("expected LightSetColorTemp, got %T", cmd)
+	}
+	if ct.Mireds != 370 {
+		t.Fatalf("mireds: got %d, want 370", ct.Mireds)
+	}
+}
+
+func TestFromAlexa_ColorTemperatureControllerRejectsOutOfRangeKelvin(t *testing.T) {
+	_, err := FromAlexa("light", "Alexa.ColorTemperatureController", "SetColorTemperature", map[string]any{
+		"colorTemperatureInKelvin": float64(10000),
+	})
+	if err == nil {
+		t.Fatal("expected error")
 	}
 }
 
