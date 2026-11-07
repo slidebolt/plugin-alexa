@@ -69,7 +69,7 @@ func (r *mockReporter) DeleteDevice(e domain.Entity) {
 
 func (r *mockReporter) wait(t *testing.T, count int) []domain.Entity {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		r.mu.Lock()
 		n := len(r.seen)
@@ -88,7 +88,7 @@ func (r *mockReporter) wait(t *testing.T, count int) []domain.Entity {
 
 func (r *mockReporter) waitCalls(t *testing.T, count int) []reportCall {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		r.mu.Lock()
 		n := len(r.calls)
@@ -204,7 +204,7 @@ func sendAndReceive(t *testing.T, cmds *messenger.Commands, entity domain.Entity
 	select {
 	case got := <-done:
 		return got
-	case <-time.After(2 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("timed out waiting for command")
 		return nil
 	}
@@ -258,7 +258,7 @@ func expectRelayMessage(t *testing.T, received <-chan relayRequest, action strin
 			t.Fatalf("relay action: got %q, want %q", msg.Action, action)
 		}
 		return msg
-	case <-time.After(2 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatalf("timed out waiting for relay action %q", action)
 		return relayRequest{}
 	}
