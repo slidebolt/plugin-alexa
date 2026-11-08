@@ -19,6 +19,13 @@ func loadConfig() Config {
 	}
 }
 
+// Unset reports whether no Alexa setting is given at all. The plugin then runs
+// disabled, so an install that does not use Alexa still starts. A partial
+// configuration is a mistake and still fails.
+func (c Config) Unset() bool {
+	return c.ClientID == "" && c.ClientSecret == "" && c.RelayToken == "" && c.WSURL == ""
+}
+
 func getEnv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

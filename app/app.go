@@ -73,6 +73,11 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 	}
 	a.subs = append(a.subs, sub)
 
+	if a.cfg.Unset() {
+		log.Printf("plugin-alexa: disabled: ALEXA_WS_URL, ALEXA_CLIENT_ID, ALEXA_CLIENT_SECRET and ALEXA_RELAY_TOKEN are not set")
+		return nil, nil
+	}
+
 	// Connect to the AWS relay as a persistent WebSocket client.
 	a.client = newClient(a.cfg, a.store, a.cmds)
 	if err := a.client.Start(); err != nil {

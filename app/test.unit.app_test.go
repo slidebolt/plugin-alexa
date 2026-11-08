@@ -1053,3 +1053,19 @@ func TestAlexaClientDeleteClearsStateCache(t *testing.T) {
 	client.BroadcastChangeReport(entity)
 	expectRelayMessage(t, received, "state_update")
 }
+
+func TestConfig_UnsetOnlyWhenNothingIsGiven(t *testing.T) {
+	if !(Config{}).Unset() {
+		t.Fatal("an empty config should be unset")
+	}
+	for _, c := range []Config{
+		{WSURL: "wss://relay"},
+		{ClientID: "id"},
+		{ClientSecret: "secret"},
+		{RelayToken: "token"},
+	} {
+		if c.Unset() {
+			t.Fatalf("%+v has a setting, so it is not unset", c)
+		}
+	}
+}
