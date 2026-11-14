@@ -46,6 +46,12 @@ func (a *App) Hello() contract.HelloResponse {
 		ContractVersion: contract.ContractVersion,
 		Definitions:     contract.DescribePlugin("Alexa", "Publishes shared domain devices and entities to Alexa without defining provider-specific entity types."),
 		DependsOn:       []string{"messenger", "storage"},
+		Setup: &contract.SetupDefinition{Mode: contract.SetupSelectable, Category: "Bridges", Fields: []contract.SetupField{
+			{Key: "websocket_url", Environment: "ALEXA_WS_URL", Name: "Relay WebSocket URL", Description: "WebSocket endpoint for the Alexa relay.", Control: contract.SetupText, Format: "uri"},
+			{Key: "client_id", Environment: "ALEXA_CLIENT_ID", Name: "Client ID", Description: "Registered relay client identifier.", Control: contract.SetupText},
+			{Key: "client_secret", Environment: "ALEXA_CLIENT_SECRET", Name: "Client secret", Description: "Secret for the registered relay client.", Control: contract.SetupSecret, Sensitive: true},
+			{Key: "relay_token", Environment: "ALEXA_RELAY_TOKEN", Name: "Relay token", Description: "Static relay authorization token.", Control: contract.SetupSecret, Sensitive: true},
+		}, Constraints: []contract.SetupConstraint{{Kind: "all_or_none", Fields: []string{"websocket_url", "client_id", "client_secret", "relay_token"}}}},
 	}
 }
 
