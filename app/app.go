@@ -44,6 +44,7 @@ func (a *App) Hello() contract.HelloResponse {
 		ID:              PluginID,
 		Kind:            contract.KindPlugin,
 		ContractVersion: contract.ContractVersion,
+		Definitions:     contract.DescribePlugin("Alexa", "Publishes shared domain devices and entities to Alexa without defining provider-specific entity types."),
 		DependsOn:       []string{"messenger", "storage"},
 	}
 }
