@@ -17,10 +17,11 @@ import (
 )
 
 const (
-	keepaliveInterval = 4 * time.Minute
-	reconnectDelay    = 5 * time.Second
-	writeTimeout      = 10 * time.Second
-	readTimeout       = 10 * time.Minute // generous; keepalive resets it
+	keepaliveInterval     = 4 * time.Minute
+	reconnectDelay        = 5 * time.Second
+	writeTimeout          = 10 * time.Second
+	readTimeout           = 10 * time.Minute // generous; keepalive resets it
+	directiveDedupeWindow = time.Second
 )
 
 // --- Wire types (AWS relay protocol) ---
@@ -75,7 +76,9 @@ type alexaClient struct {
 	mu   sync.Mutex
 	conn *websocket.Conn
 
-	lastAlexaState map[string]string
+	lastAlexaState   map[string]string
+	recentDirectives map[string]time.Time
+	now              func() time.Time
 
 	stopCh chan struct{}
 	doneCh chan struct{}
@@ -86,12 +89,14 @@ type alexaClient struct {
 
 func newClient(cfg Config, store storage.Storage, cmds *messenger.Commands) *alexaClient {
 	return &alexaClient{
-		cfg:            cfg,
-		store:          store,
-		cmds:           cmds,
-		lastAlexaState: make(map[string]string),
-		stopCh:         make(chan struct{}),
-		doneCh:         make(chan struct{}),
+		cfg:              cfg,
+		store:            store,
+		cmds:             cmds,
+		lastAlexaState:   make(map[string]string),
+		recentDirectives: make(map[string]time.Time),
+		now:              time.Now,
+		stopCh:           make(chan struct{}),
+		doneCh:           make(chan struct{}),
 	}
 }
 
@@ -403,6 +408,10 @@ func (c *alexaClient) handleDirective(d *awsDirective) {
 
 	// Route the command to the entity's owning plugin via messenger.
 	if actionCmd, ok := cmd.(messenger.Action); ok && c.cmds != nil {
+		if !c.shouldRouteDirective(endpointID, actionCmd) {
+			log.Printf("plugin-alexa: duplicate directive suppressed endpoint_id=%s action=%s window=%s", endpointID, actionCmd.ActionName(), directiveDedupeWindow)
+			return
+		}
 		target := domain.EntityKey{Plugin: entity.Plugin, DeviceID: entity.DeviceID, ID: entity.ID}
 		if err := c.cmds.Send(target, actionCmd); err != nil {
 			log.Printf("plugin-alexa: route command to %s: %v", target.Key(), err)
@@ -411,6 +420,46 @@ func (c *alexaClient) handleDirective(d *awsDirective) {
 		log.Printf("plugin-alexa: route command ok target=%s action=%s command=%T %s", target.Key(), actionCmd.ActionName(), actionCmd, commandLogDetails(actionCmd))
 	} else {
 		log.Printf("plugin-alexa: directive command not routable endpoint_id=%s command=%T cmds_available=%t", endpointID, cmd, c.cmds != nil)
+	}
+}
+
+// shouldRouteDirective suppresses only idempotent state-setting commands. It
+// intentionally does not suppress presses, toggles, track changes, or other
+// commands where two rapid requests can legitimately mean two actions.
+func (c *alexaClient) shouldRouteDirective(endpointID string, cmd messenger.Action) bool {
+	if !deduplicatableAlexaAction(cmd.ActionName()) {
+		return true
+	}
+	raw, err := json.Marshal(cmd)
+	if err != nil {
+		return true
+	}
+	fingerprint := endpointID + "\x00" + cmd.ActionName() + "\x00" + string(raw)
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, seen := range c.recentDirectives {
+		if now.Sub(seen) >= directiveDedupeWindow {
+			delete(c.recentDirectives, key)
+		}
+	}
+	if seen, exists := c.recentDirectives[fingerprint]; exists && now.Sub(seen) < directiveDedupeWindow {
+		return false
+	}
+	c.recentDirectives[fingerprint] = now
+	return true
+}
+
+func deduplicatableAlexaAction(action string) bool {
+	switch action {
+	case "light_turn_on", "light_turn_off", "light_set_brightness", "light_set_color_temp",
+		"light_set_hs", "light_set_rgb", "light_set_rgbw", "light_set_rgbww", "light_set_white", "light_set_xy",
+		"switch_turn_on", "switch_turn_off", "fan_turn_on", "fan_turn_off", "fan_set_speed",
+		"climate_set_mode", "climate_set_temperature", "cover_open", "cover_close", "cover_set_position",
+		"lock_lock", "lock_unlock", "media_play", "media_pause", "media_stop", "media_mute", "media_set_volume", "media_select_source":
+		return true
+	default:
+		return false
 	}
 }
 
